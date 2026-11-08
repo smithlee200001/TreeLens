@@ -1,3 +1,4 @@
+pub mod deletion;
 pub mod footprint;
 pub mod scanner;
 pub mod session;

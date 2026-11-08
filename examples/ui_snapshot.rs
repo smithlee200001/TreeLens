@@ -26,6 +26,7 @@ fn main() -> Result<()> {
         .next()
         .and_then(|s| s.to_str()?.parse::<f32>().ok())
         .unwrap_or(920.0);
+    let deletion_preview = args.next().is_some_and(|flag| flag == "--delete-dialog");
     let mut cx = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
         Arc::new(gpui_kit::assets::Assets),
@@ -36,7 +37,7 @@ fn main() -> Result<()> {
         Theme::change(ThemeMode::Dark, None, cx);
         app::install_theme(cx);
     });
-    let (handle, _) = cx.update(|cx| {
+    let (handle, view) = cx.update(|cx| {
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -55,6 +56,13 @@ fn main() -> Result<()> {
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(50));
         cx.advance_clock(Duration::from_millis(80));
+        cx.run_until_parked();
+    }
+    if deletion_preview {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| app.preview_delete_confirmation(window, cx));
+        })?;
+        cx.advance_clock(Duration::from_millis(300));
         cx.run_until_parked();
     }
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;

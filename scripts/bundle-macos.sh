@@ -9,9 +9,12 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "Rust is required: https://rustup.rs" >&2
   exit 1
 fi
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 # Native architecture by default. Optionally pass aarch64-apple-darwin or x86_64-apple-darwin.
 TARGET="${1:-}"
+if [[ ! -f Cargo.lock ]]; then
+  cargo generate-lockfile
+fi
 ARGS=(--release --locked)
 BINARY="target/release/tree-lens"
 if [[ -n "$TARGET" ]]; then
@@ -34,10 +37,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Tree Lens</string>
   <key>CFBundleExecutable</key><string>tree-lens</string>
   <key>CFBundleIdentifier</key><string>local.treelens.app</string>
-  <key>CFBundleVersion</key><string>2</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>0.3.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSHumanReadableCopyright</key><string>Tree Lens contributors</string>

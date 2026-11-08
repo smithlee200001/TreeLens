@@ -1,109 +1,104 @@
-# Tree Lens 0.2
+# Tree Lens 0.3 · GPUI Kit
 
-用 Rust 开发的 macOS 文件夹空间分析工具。选择一个文件夹，以可展开的树形结构查看各级文件夹与文件的磁盘占用。独立实现，不是 TreeSize 的移植版，也不依赖 TreeSize。
+Rust 编写的 macOS 只读磁盘空间分析工具。0.3 将 **eframe / egui 完全替换为 GPUI Kit 0.9.0**，使用原生 GPU 窗口与控件，不是网页套壳，也没有保留另一套旧 UI。
 
-## 已实现
+> **交付状态：已通过 Linux GUI 类型检查、严格 Clippy、26 项核心测试及 3 项 GPUI 交互测试，并完成真实离屏渲染检查；macOS 原生验收尚未执行。** 具体验证范围见 [TESTING.md](TESTING.md)。此源码包不是签名安装包。
 
-- macOS 原生文件夹选择窗口，也支持路径输入、`~` 路径和拖入文件夹。
-- 可展开、收起的目录树，同时显示磁盘占用、逻辑大小、占父级比例和文件数量。
-- 点击表头按占用、逻辑大小、名称或文件数排序；名称筛选会保留匹配项目的祖先路径。
-- 后台扫描、实时进度、取消、刷新；窗口关闭时取消扫描。
-- 隐藏文件和 `.app` 包参与统计；符号链接不展开，防止循环。
-- 稀疏文件使用实际分配块数；同一次扫描内硬链接的磁盘占用去重。
-- 权限或读取错误不会中断其他目录；显示问题列表和统计不完整提示。
-- 右键复制路径、在 Finder 中显示。只读，不包含删除、移动或清理操作。
-- 虚拟滚动只绘制屏幕上的行；树索引按视口获取行，不再保存全部展开项目的扁平行列表。
-- 节点只保存文件名和父节点，按需还原完整路径；进度只保留最新一份，避免 UI 暂停时积压。
-- 扫描和树遍历均不使用递归调用栈，名称筛选有 180ms 防抖。
+## 新界面
+
+![Tree Lens 0.3 实际 GPUI 界面](docs/preview-wide.png)
+
+上图由应用真实 GPUI 离屏渲染器生成，使用专门创建的示例目录，不是 macOS 实机截图。另见 [最小窗口预览](docs/preview-minimum.png)。
+
+- 深蓝黑工作台、青绿主色、渐变统计卡片与彩色空间地图。
+- 空间地图按真实分配量布局，点击目录可深入，支持返回根目录。最多保留 11 个直接子项和合并的剩余项，不复制完整扫描树。
+- GPUI `uniform_list` 虚拟文件树：仅生成视口行，继续使用 0.2 的紧凑节点与按需树索引。
+- 宽窗口显示快捷目录侧栏和项目详情栏；较窄窗口隐藏辅助侧栏，保持树列表宽度。
+- GPUI Kit 原生输入、按钮、图标、上下文菜单、对话框和扫描动画。使用系统字体及其中文回退，不把整个 CJK 字体文件读入应用。
+- macOS 系统目录选择器由 GPUI 提供，不再依赖 `rfd`。
+
+## 保留的功能
+
+文件夹选择、绝对路径/`~` 输入、文件夹拖放、后台扫描、最新进度合并、取消及部分结果提示、刷新、目录展开/收起、四种排序、180ms 防抖名称筛选、复制完整路径、Finder 显示与读取问题列表。
+
+扫描器和虚拟树算法与 0.2 **逐字节一致**。不读取文件内容，不上传结果，不包含删除、清理或移动操作。符号链接不展开，硬链接分配空间在同次扫描中去重，跨设备挂载点跳过。
 
 ## 在 Mac 上运行
 
-需要 macOS 11 或以上、Xcode Command Line Tools，以及最新稳定版 Rust。当前交付的是源码，不是已签名安装包。建议先选一个普通文件夹验证。
+当前 GPUI Kit 官方要求 **macOS 15 或更高版本**、Xcode Command Line Tools、**Rust 1.92 或更新版本**。这比 0.2 的系统要求更高。请先确认本机满足要求。
 
-1. 如果尚未安装 Apple 编译工具：`xcode-select --install`。
-2. 从官方 [rustup.rs](https://rustup.rs/) 安装 Rust，然后重新打开终端。
-3. 在本目录执行：
+1. 如尚未安装 Apple 开发工具：`xcode-select --install`。
+2. 从 [Rust 官方网站](https://rust-lang.org/tools/install/) 安装 Rust，重新打开终端后检查 `rustc --version` 和 `cargo --version`。
+3. 在项目目录执行：
 
 ```sh
 cargo run --locked --release
 ```
 
-也可以直接指定要扫描的路径：
+指定扫描目录：
 
 ```sh
 cargo run --locked --release -- "$HOME/Downloads"
 ```
 
-快捷键：`⌘O` 选择文件夹，`⌘R` 重新扫描。大目录扫描没有预先已知总量，因此展示已读取项目数，不显示虚假的百分比进度。取消会保留已扫描部分并显著标注。
+本包包含本次解析生成的新版 `Cargo.lock`，`gpui-kit` 固定为 `=0.9.0`。请保留锁文件并使用 `--locked`，不要用旧版 egui 锁文件替换。
 
-## 打包成 .app
+快捷键：`⌘O` 选择文件夹、`⌘R` 刷新、`⌘F` 筛选、`Esc` 关闭对话框或取消扫描、`⌘Q` 退出。Linux 开发环境同时支持 Ctrl+O/R/F，但正式目标仍是 macOS。
+
+## 打包
 
 ```sh
 bash scripts/bundle-macos.sh
 open "dist/Tree Lens.app"
 ```
 
-默认编译当前 Mac 的架构。需要另一架构时，先 `rustup target add x86_64-apple-darwin` 或 `rustup target add aarch64-apple-darwin`，然后把目标名称作为脚本参数传入。脚本不是通用二进制构建器；每次生成一个架构。
+脚本使用包内锁文件构建，仅在锁文件缺失时生成，最低系统设为 macOS 15。默认生成当前 Mac 架构；可传入 `aarch64-apple-darwin` 或 `x86_64-apple-darwin`，需先安装对应 Rust target。它不是 Universal Binary 构建器。
 
-`.app` 为本机开发包，没有 Developer ID 签名或 Apple 公证。公开分发需使用你自己的 Apple 开发者签名和公证流程；本项目不绕过 Gatekeeper。已提供 GitHub Actions macOS 构建/测试配置，尚未实际提交到远端或触发执行。
+本机开发 `.app` 不包含 Developer ID 签名和 Apple 公证。公开分发需独立完成自己的签名、公证和真实 Mac 验收；项目不绕过 Gatekeeper。
 
-## 统计口径与 macOS 注意事项
-
-- **逻辑大小**：非目录项目的 `metadata.len()`；目录为后代项目的逻辑长度之和，不计目录自身的逻辑长度。符号链接本身长度也会统计。
-- **磁盘占用**：Unix/macOS 的 `metadata.blocks() × 512`，包括目录元数据。不要把逻辑长度当作实际磁盘占用。
-- **硬链接**：同一 `(device, inode)` 的非目录项目，在同一次扫描中只贡献一次磁盘占用。逻辑大小按路径分别计数。哪个路径贡献磁盘占用取决于系统枚举顺序，因此独立扫描某个子目录时，其占用可能不同。
-- **APFS**：克隆、共享数据块、压缩、快照、可清除空间等不能仅靠 `stat` 精确归属。显示值是文件系统报告的分配量，不保证等于删除后可释放的容量，也不保证与系统“储存空间”面板一致。
-- **iCloud / File Provider**：不读取文件内容、不主动请求下载；元数据访问仍由系统和提供商处理。
-- **挂载点**：不跨入不同 `device` 的子目录，显示跳过提示。可单独选择另一个卷扫描。
-- **权限**：遇到无权访问的项目会记录问题而非提权。需要时可自行在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”授权应用。从 `cargo run` 启动时可能需要授权终端。无需为了普通文件夹扫描授予完全磁盘访问权限。
-- 扫描是文件系统的实时、尽力而为视图，不是原子快照；扫描中新增、删除或变更文件会影响结果。路径级读取不能彻底消除并发替换为符号链接的竞争条件。
-- 扫描结果仍为每个项目保留一条紧凑元数据，内存随项目数量增长。该 MVP 尚未使用数据库或按需重新扫描。虚拟树额外缓存主要随展开的文件夹数量增长；筛选另用压缩位图和必要的子项位置索引。完全展开大量文件夹时仍会增加索引内存。
-- 文件数量只计常规文件，不把符号链接当成目标文件。容量使用 KiB/MiB/GiB（1024 进制）。
-
-## 开发与验证
+## 验证
 
 ```sh
 cargo fmt --all -- --check
-cargo test --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-cargo run --locked --no-default-features --example scan -- /path/to/folder
+cargo test --locked --no-default-features --all-targets
+cargo check --locked --all-targets
+cargo test --locked --features ui-tests --all-targets
+cargo clippy --locked --features ui-tests --all-targets -- -D warnings
+cargo run --locked --no-default-features --example scan -- src
 ```
 
-只测无 GUI 的核心：`cargo test --locked --no-default-features`。Linux 开发环境可以编译 GUI、输入路径测试，但原生目录选择器和 Finder 菜单只在 macOS 启用；正式支持目标仍是 macOS。
+核心测试不需要显示系统。GUI 完整编译仍需要平台依赖。Linux 要求及 macOS 最低版本参见 [GPUI Kit 官方安装文档](https://gpui-kit.com/docs/installation/)。仓库附带 macOS 15 CI 工作流，**本次没有上传或触发远端 CI**。
 
-结构：
+手动验收：选择目录 → 关闭选择器 → 再选择 → 展开/收起 → 排序/筛选/清除 → 点击地图深入/回根 → 复制/Finder → 扫描时取消 → 立即重复点击 → 完成后重扫 → 拖入目录 → 读取错误 → 说明弹窗 Esc/Tab → 最小/宽窗口 → 中文长路径 → 扫描中关闭窗口。
 
-- `src/scanner.rs`：独立于 GUI 的扫描、统计、取消和错误收集。
-- `src/tree.rs`：原地排序、筛选位图、子树行数索引和按视口随机访问。
-- `src/app.rs`：egui 界面和后台任务协调。
-- `examples/scan.rs`：用于核对结果的无界面入口。
-- `scripts/bundle-macos.sh`：生成本地 `.app`。
+## 统计口径
 
-测试覆盖普通/嵌套目录、空目录、`.app` 包、硬链接、稀疏文件、符号链接循环/失效链接、取消、无效根路径、扫描时目录消失、错误详情上限、深路径/非 UTF-8 名称还原、筛选/祖先显示、排序、全部展开组合、十万行虚拟索引、十万项目 GUI 只生成视口绘制数据，以及进度合并。
+- **磁盘占用**：Unix `metadata.blocks() × 512`，包括目录元数据。**逻辑大小**为非目录项目长度，目录为后代长度之和。
+- **硬链接**：同一 `(device, inode)` 的非目录项目只贡献一次分配空间；逻辑大小按路径计数。贡献哪个路径由枚举顺序决定。
+- **APFS**：克隆、共享块、快照、压缩和可清除空间不能靠 `stat` 精确归属。此值不等于删除后可释放空间，也不保证与系统储存空间一致。
+- **iCloud**：不主动读取文件内容或请求下载，元数据访问仍由系统与提供商处理。
+- **权限**：问题单独记录，不提权、不修改权限。需要时可由你自行在系统设置中授权完全磁盘访问，不必为普通目录扫描开启。
+- **一致性**：扫描为实时尽力而为视图，不是原子快照；扫描中变化及路径替换竞争可能影响结果。
+- **容量**使用 1024 进制的 KiB/MiB/GiB。文件数只计常规文件。
+- **内存**仍随扫描项目数增长。0.2 的内存基准可在 [benchmarks/README.md](benchmarks/README.md) 复现；它不是 0.3 GPUI 整个进程的内存或 GPU 基准。新版不声称降低整体 GUI 内存或提高特定帧率。
 
-macOS 手动验收建议：选择文件夹 → 展开两层 → 排序/筛选 → 收起/清空筛选 → 刷新 → 扫描中取消 → 再扫描其他文件夹 → 关闭选择对话框 → 右键 Finder → 拖入文件夹 → 中文长文件名 → 权限不足的目录。不要把跨平台单元测试当作已经完成 macOS 原生窗口验收。
+## 结构与来源
 
-## 0.2 内存优化与实测
+- `src/main.rs`：GPUI Kit 启动、原生窗口、主题与生命周期。
+- `src/app.rs`：GPUI Kit 界面、系统选择器、虚拟列表、菜单和对话框。
+- `src/session.rs`：独立 GUI 的扫描会话、取消、进度与筛选。
+- `src/footprint.rs`：有界面积图投影、布局测试。
+- `src/scanner.rs` / `src/tree.rs`：原 0.2 扫描及低内存虚拟树。
+- `scripts/bundle-macos.sh`：本地 `.app`；`.github/workflows/`：待运行的 macOS 检查。
 
-原来的 GUI 已经使用 egui `show_rows`，但仍保留所有展开行的列表，以及每个节点的完整路径。0.2 进一步改为：
+采用 Longbridge 的 [GPUI Kit](https://github.com/longbridge/gpui-kit)，核对了 crates.io 发布的 0.9.0 源码及其 GPUI 0.3.11 API。官方入口是 `gpui_kit::*` 和 `gpui_kit::component`，不是另一个同名库。参考：[开始使用](https://gpui-kit.com/docs/getting-started/)、[任务与后台执行](https://gpui-kit.com/docs/task/)。第三方软件保留各自许可证。
 
-1. **数据也按视口访问**：使用展开目录的子树行数索引，通过二分查找定位任意行；只生成本屏幕的几十行。不再保存每个可见文件的 `(id, depth)`。
-2. **精简扫描节点**：只保存精确文件名与父节点，完整路径在扫描子目录、显示提示或执行 Finder 操作时还原。文件名的非 UTF-8 字节不会丢失。
-3. **控制附加缓存**：展开状态只记录目录，不记录文件；切换排序复用原有子项数组；折叠/重新扫描释放旧索引；进度使用最新值槽位；筛选避免每次按键立即扫描全树。
+## 可复现的界面检查
 
-同一份长路径、10 万空文件/100 个目录的合成样本，Linux 上对 Rust 申请的堆字节进行计量：
+`ui-tests` 启用 GPUI Kit 官方测试支持。`examples/ui_snapshot.rs` 使用真实离屏 GPU 渲染器，可在有可用图形驱动的开发环境生成界面图，不以浏览器或手绘图替代。
 
-- 扫描结果保留堆：49.46 → 15.77 MiB（减少约 68%）。
-- 扫描峰值堆：49.46 → 20.02 MiB（减少约 60%）。
-- 全部展开的树索引：2.00 MiB → 10.14 KiB（减少约 99.5%）。
-- 一次 50 行视口只临时分配约 1 KiB。
+```sh
+cargo run --locked --features ui-tests --example ui_snapshot -- src preview.png
+```
 
-这不是 macOS 活动监视器的整个进程内存；不包含字体、GPU、系统库及分配器缓存。路径深度/长度会影响优化幅度。新索引使用少量查询计算换取更低内存，并不声称比旧数组访问更快。
-
-单个文件从 0 字节变成 1 TiB 的稀疏文件，扫描模型占用不变，因为从来不读取文件内容。若你的“一个大文件”确实只含一个条目，而不是含很多条目的大文件夹，仍需在真实 Mac 上进一步分析 GUI/字体/GPU 或系统层内存。
-
-复现方法、原版冻结核心、基准程序及原始测量见 [benchmarks/README.md](benchmarks/README.md)。
-
-## 技术选择
-
-纯 Rust 应用：`eframe/egui` 绘制界面，`rfd` 提供 macOS 原生目录选择器，标准库执行扫描。没有 WebView、前端构建链或后台服务器。依赖版本及完整解析结果已保存在 `Cargo.lock`，请保留 `--locked` 以使用相同版本。
+它等待约 1.5 秒让扫描进度汇入界面。大目录若尚未完成，截图会保留真实的扫描中状态。离屏检查不替代 macOS 系统选择器、Finder、窗口拖放和隐私权限验收。

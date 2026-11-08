@@ -1,42 +1,55 @@
-# Tree Lens 0.2 验证记录
+# Tree Lens 0.3 验证记录
 
-验证日期：2026-11-03。执行环境为 Linux x86_64，Rust 1.99.1。源码中面向 macOS 的部分另做了 Apple Silicon 目标类型检查。
+日期：2026-11-08。执行环境：Linux x86_64，Rust / Cargo 1.99.1 官方工具链；不是 macOS。GPUI Kit 0.9.0，GPUI 0.3.11，依赖版本以包内 `Cargo.lock` 为准。
 
-## 已通过
+## 已执行并通过
 
-- `cargo fmt --all -- --check`
-- `cargo test --locked --all-targets`：23 项测试通过（18 项核心/数据模型 + 5 项无窗口 GUI/状态测试）。
-- `cargo clippy --locked --all-targets -- -D warnings`
-- `cargo check --locked --target aarch64-apple-darwin --all-targets`：包括 macOS 文件夹选择窗口和 Finder 菜单代码，类型检查通过。
-- `cargo test --locked --no-default-features`：18 项核心测试通过。
-- `cargo run --locked --no-default-features --example scan -- src`：正常扫描源码目录，错误数为 0。
+- `cargo fmt --all -- --check`。
+- `cargo test --locked --no-default-features --all-targets`：26 项核心测试通过。
+- `cargo check --locked --all-targets`：包括完整 GPUI 界面及常规示例的类型检查通过。
+- `cargo test --locked --features ui-tests --all-targets`：26 项核心测试、3 项 GPUI 界面交互测试通过；截图示例复用界面模块，因此同样 3 项界面测试额外执行一次，共 32 次测试执行、29 个不同测试。
+- `cargo clippy --locked --features ui-tests --all-targets -- -D warnings`：严格检查通过，无警告。
+- `cargo run --locked --no-default-features --example scan -- src`：实际扫描成功，7 个文件，0 个读取问题。
 - `bash -n scripts/bundle-macos.sh`：脚本语法通过。
+- 对比 v0.2：`src/scanner.rs` 与 `src/tree.rs` 均逐字节相同。
 
-## 覆盖重点
+### 26 项核心测试覆盖
 
-- 目录累计值、空目录、`.app` 包作为目录处理。
-- 硬链接逻辑大小按路径统计、分配空间去重。
-- 稀疏文件使用分配块而非文件长度。
-- 符号链接循环和失效链接不递归，文件/符号链接作为根时返回错误。
-- 中途取消、扫描时目录消失、错误详情最多 500 条但总数完整。
-- 按大小排序、大小写不敏感筛选及祖先路径显示。
-- 无窗口 egui 生成界面和绘制网格：空状态、扫描结果、1180×780 和 820×560 两种尺寸。
-- 扫描失败后重试、忙碌状态重复开始不创建第二个扫描。
-- 100,000 个文件的树索引：普通平面目录不分配全部行缓存，筛选使用压缩位图。
-- 100,000 个项目的 egui 界面只生成视口规模的绘制数据，而非所有项目。
-- 不同折叠组合/筛选结果/排序的索引与参考遍历逐项一致。
-- 10,000 次进度更新只保留最新一次，旧进度不会累积。
-- 128 层深路径和非 UTF-8 文件名精确还原。
+原 18 项 scanner/tree/format_bytes 测试保留，包含目录汇总、硬链接去重、稀疏文件、符号链接循环、非 UTF-8 路径、深目录、取消、读取问题上限、树排序和筛选、十万节点按需索引。新增 6 项 Session 测试验证后台结果与筛选同步、线程断开恢复、取消期间防重复启动、销毁时取消、进度合并、180ms 防抖及主目录展开；新增 2 项空间地图测试验证空输入、有限数值、面积比例和不重叠。
 
-## 尚未验证
+旧的 egui 绘制测试随旧界面删除。新版界面由 GPUI 测试直接验证，不使用旧测试冒充。
 
-- 没有在真实 macOS 系统链接、启动或点击原生窗口。目标类型检查不等于 macOS 应用已运行。
-- 未执行 Apple 原生选择窗口、Finder 跳转、系统隐私授权、APFS/iCloud 真实卷、Intel Mac 手动测试。
-- 未实际生成/签名/公证 `.app`，也未运行仓库附带的远端 CI。
-- Linux 环境无法建立可用图形显示，因此没有原生 GUI 截图；上述 GUI 测试为无窗口布局和绘制逻辑测试，不替代视觉验收。
+### 3 项 GPUI 交互测试覆盖
 
-在 Mac 上按 README 的运行和手动验收步骤完成这些检查后，再考虑公开分发。
+1. 1080 × 760 最小窗口中的空状态与说明对话框，模拟点击打开，Esc 关闭。
+2. 通过启动参数扫描真实临时目录，检查结果行、列宽、名称排序、展开/收起和保留的筛选输入实体。
+3. 注入 100,000 个文件节点，确认可见树为 100,001 行，但实际生成的界面行少于 100，未全量绘制。
 
-## 内存基准
+这些为 GPUI 官方无窗口测试环境中的布局及模拟事件测试，不等于操作系统原生窗口的人工验收。
 
-旧版与新版扫描同一 100,000 文件样本，各重复五次。核心扫描保留堆减少约 68%，展开树索引保留堆减少约 99.5%。具体原始字节数、测量范围及可复现脚本见 `benchmarks/README.md`。这些结果不是整个进程的 RSS 或 macOS GUI 实测。
+## 实际渲染与视觉检查
+
+使用 `examples/ui_snapshot.rs`、GPUI 官方离屏渲染器及系统现有 Chromium SwiftShader Vulkan 软件驱动，扫描一个真实创建的示例目录，再保存应用的渲染帧：
+
+- `docs/preview-wide.png`：1440 × 920 逻辑像素，2 倍输出，含左右侧栏、统计卡片、空间地图与虚拟文件树。
+- `docs/preview-minimum.png`：1080 × 760 逻辑像素，2 倍输出，辅助侧栏自动隐藏，文件树可滚动。
+
+已目视检查中文字体、主要文字、地图比例、列对齐和窗口边界；修复了检查中发现的列表宽度及表头对齐问题，并重新运行测试和截图。截图使用 18 个文件、6 个子目录、141 MiB 的合成演示数据，不包含用户文件。小地图块会有意隐藏部分标签，以 tooltip 提供名称和大小。
+
+软件驱动的离屏截图不是帧率、GPU 性能或 macOS 实机结果；系统字体、标题栏及窗口按钮在 Mac 上可能不同。
+
+## Linux 验证环境说明
+
+本次工具链安装在开发工作区，没有修改系统安装。Linux 构建使用 `RUST_FONTCONFIG_DLOPEN=1`，让已有 fontconfig 运行库动态加载；测试链接通过 `LIBRARY_PATH` 指向工作区中已有 xcb / xkbcommon 运行库的链接。渲染时 `VK_DRIVER_FILES` 指向系统已有 SwiftShader 驱动。
+
+这是当前 Linux 环境的开发配置，不应复制到 Mac。常规 Mac 构建使用 README 命令和 GPUI Kit 官方依赖要求。未单独验证最低 Rust 1.92，当前实际测试版本为 1.99.1。
+
+## 未执行，不代表通过
+
+- macOS 目标编译与链接、真实原生窗口启动、Metal 渲染、Apple Silicon / Intel 双架构验证。
+- 系统目录选择器、Finder 显示、操作系统文件拖放、原生剪贴板、macOS 中文字体回退及系统快捷键的端到端测试。
+- APFS 克隆/快照/iCloud/完全磁盘访问与权限拒绝的 macOS 实机测试。
+- `.app` 打包执行、Developer ID 签名、Apple 公证、远端 CI。
+- 新版整个 GUI 进程的内存、GPU 占用、帧率与大型真实磁盘性能基准。
+
+源码包附带 macOS 15 CI 配置和本地打包脚本，但本次没有推送 GitHub 或触发远端工作流。必须在真实 Mac 上完成以上验收后，才可称为经过 macOS 验收的安装包。`TESTING-v0.2.md` 和旧内存基准只记录旧版，不适用于新版整体 GUI 性能。

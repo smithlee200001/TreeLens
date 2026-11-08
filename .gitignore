@@ -1,3 +1,4 @@
 **/target/
+/target-core/
 /dist/
 .DS_Store

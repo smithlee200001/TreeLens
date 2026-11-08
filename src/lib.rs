@@ -1,4 +1,6 @@
+pub mod footprint;
 pub mod scanner;
+pub mod session;
 pub mod tree;
 
 /// Binary units: the app never labels powers of 1024 as decimal MB/GB.

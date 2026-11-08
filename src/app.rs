@@ -1,998 +1,1547 @@
-use eframe::egui::{self, Color32, FontFamily, RichText, Vec2};
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
-use tree_lens::format_bytes;
-use tree_lens::scanner::{self, NodeId, NodeKind, ScanOutcome, ScanProgress};
-use tree_lens::tree::{sort_tree, SortBy, VisibleTree};
+//! Native GPUI Kit presentation. Scanning and virtual indexing live in `session`.
+use gpui_kit::component::{
+    button::{Button, ButtonVariants},
+    input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt, PopupMenuItem},
+    spinner::Spinner,
+    tooltip::Tooltip,
+    Disableable, Icon, IconName, Sizable, Theme, TitleBar, WindowExt,
+};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use std::{ops::Range, path::PathBuf, time::Duration};
+use tree_lens::{
+    footprint::{self, Tile},
+    format_bytes,
+    scanner::{NodeId, NodeKind},
+    session::{expand_home, Session},
+    tree::SortBy,
+};
 
-const ACCENT: Color32 = Color32::from_rgb(97, 201, 174);
-const MUTED: Color32 = Color32::from_rgb(149, 160, 177);
-const WARN: Color32 = Color32::from_rgb(242, 187, 98);
-const ROW_HEIGHT: f32 = 31.0;
+const BG: u32 = 0x0b1017;
+const PANEL: u32 = 0x111923;
+const BORDER: u32 = 0x243241;
+const TEXT: u32 = 0xe8f1f8;
+const MUTED: u32 = 0x8fa3b8;
+const CYAN: u32 = 0x69e0d3;
+const LIME: u32 = 0xc4ed9c;
+const AMBER: u32 = 0xf6c77b;
+const PALETTE: [(u32, u32); 8] = [
+    (0x194c4b, 0x69e0d3),
+    (0x253f5b, 0x8dbdfb),
+    (0x43375c, 0xc4a4f7),
+    (0x485337, 0xc4ed9c),
+    (0x584332, 0xf6c77b),
+    (0x50364b, 0xeab3d6),
+    (0x244b56, 0x8fdae9),
+    (0x3d475a, 0xc4d1e4),
+];
 
-enum WorkerEvent {
-    Finished(Result<ScanOutcome, String>),
+gpui_kit::actions!(
+    tree_lens,
+    [OpenFolder, Refresh, FocusSearch, CancelScan, Quit]
+);
+
+pub fn install_theme(cx: &mut App) {
+    Theme::update(cx, |theme| {
+        theme.font_size = px(14.0);
+        theme.radius = px(9.0);
+        theme.colors.background = rgb(BG).into();
+        theme.colors.foreground = rgb(TEXT).into();
+        theme.colors.border = rgb(BORDER).into();
+        theme.colors.input = rgb(0x0c141e).into();
+        theme.colors.primary = rgb(CYAN).into();
+        theme.colors.button_primary = rgb(CYAN).into();
+        theme.colors.button_primary_hover = rgb(0x91eee3).into();
+        theme.colors.button_primary_active = rgb(0x4cc3b7).into();
+        theme.colors.button_primary_foreground = rgb(0x092322).into();
+        theme.colors.button = rgb(0x1a2634).into();
+        theme.colors.button_hover = rgb(0x26394a).into();
+        theme.colors.button_foreground = rgb(TEXT).into();
+        theme.colors.accent = rgb(0x213b40).into();
+        theme.colors.accent_foreground = rgb(CYAN).into();
+    });
+    cx.bind_keys([
+        KeyBinding::new("cmd-o", OpenFolder, None),
+        KeyBinding::new("cmd-r", Refresh, None),
+        KeyBinding::new("cmd-f", FocusSearch, None),
+        KeyBinding::new("escape", CancelScan, Some("TreeLens")),
+        KeyBinding::new("cmd-q", Quit, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-o", OpenFolder, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-r", Refresh, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-f", FocusSearch, None),
+    ]);
 }
 
 pub struct TreeLensApp {
-    path_text: String,
-    root_path: Option<PathBuf>,
-    initial_path: Option<PathBuf>,
-    result: Option<ScanOutcome>,
-    receiver: Option<mpsc::Receiver<WorkerEvent>>,
-    cancel: Option<Arc<AtomicBool>>,
-    started: Option<Instant>,
-    progress: Option<ScanProgress>,
-    status: String,
-    expanded: HashSet<NodeId>,
-    rows: VisibleTree,
-    latest_progress: Option<Arc<Mutex<Option<ScanProgress>>>>,
-    query_changed: Option<Instant>,
-    applied_query: String,
-    query: String,
-    sort: SortBy,
-    selected: Option<NodeId>,
-    show_issues: bool,
-    show_about: bool,
+    session: Session,
+    path_input: Entity<InputState>,
+    search_input: Entity<InputState>,
+    focus: FocusHandle,
+    scroll: UniformListScrollHandle,
+    tiles: Vec<Tile>,
+    map_parent: Option<NodeId>,
+    generation: u64,
+    choosing: bool,
+    _subscriptions: Vec<Subscription>,
+    _ticker: Task<()>,
+    picker: Option<Task<()>>,
 }
 
 impl TreeLensApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
-        Self::with_context(&cc.egui_ctx, initial_path)
+    pub fn new(initial: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let path_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("输入路径，或拖入文件夹…")
+                .default_value(
+                    initial
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                )
+        });
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("筛选名称…"));
+        let subscriptions = vec![
+            cx.subscribe_in(&path_input, window, |this, state, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let value = state.read(cx).value().to_string();
+                    if !value.trim().is_empty() {
+                        this.start(expand_home(&value), window, cx);
+                    }
+                }
+            }),
+            cx.subscribe_in(&search_input, window, |this, state, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.session.set_query(state.read(cx).value().to_string());
+                    cx.notify();
+                }
+            }),
+        ];
+        let ticker = cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(80))
+                .await;
+            if this
+                .update(cx, |this, cx| {
+                    let was_busy = this.session.busy();
+                    let search_pending = this.session.query != this.session.applied_query();
+                    if this.session.poll() {
+                        if was_busy && !this.session.busy() {
+                            this.reset_projection();
+                            this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        }
+                        if search_pending {
+                            this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        }
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        });
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let mut app = Self {
+            session: Session::new(),
+            path_input,
+            search_input,
+            focus,
+            scroll: UniformListScrollHandle::new(),
+            tiles: Vec::new(),
+            map_parent: None,
+            generation: 0,
+            choosing: false,
+            _subscriptions: subscriptions,
+            _ticker: ticker,
+            picker: None,
+        };
+        if let Some(path) = initial {
+            app.start(path, window, cx);
+        }
+        app
     }
 
-    fn with_context(ctx: &egui::Context, initial_path: Option<PathBuf>) -> Self {
-        install_fonts(ctx);
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(22, 26, 34);
-        visuals.window_fill = Color32::from_rgb(30, 35, 44);
-        visuals.selection.bg_fill = Color32::from_rgb(37, 83, 78);
-        visuals.selection.stroke.color = ACCENT;
-        ctx.set_visuals(visuals);
-        ctx.style_mut(|style| {
-            style.spacing.item_spacing = Vec2::new(10.0, 8.0);
-            style.spacing.button_padding = Vec2::new(12.0, 7.0);
+    fn start(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.busy() {
+            return;
+        }
+        let _ = self.session.start(path.clone());
+        self.generation = self.generation.wrapping_add(1);
+        self.path_input.update(cx, |input, cx| {
+            input.set_value(path.display().to_string(), window, cx)
         });
-        Self {
-            path_text: initial_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            initial_path,
-            root_path: None,
-            result: None,
-            receiver: None,
-            cancel: None,
-            started: None,
-            progress: None,
-            status: "选择一个文件夹，了解空间都用在了哪里。".into(),
-            expanded: HashSet::new(),
-            rows: VisibleTree::new(),
-            latest_progress: None,
-            query_changed: None,
-            applied_query: String::new(),
-            query: String::new(),
-            sort: SortBy::default(),
-            selected: None,
-            show_issues: false,
-            show_about: false,
+        self.search_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.tiles.clear();
+        self.map_parent = None;
+        cx.notify();
+    }
+
+    fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.busy() || self.choosing || window.has_active_dialog(cx) {
+            return;
+        }
+        self.choosing = true;
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择要分析的文件夹".into()),
+        });
+        self.picker = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = picker.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.choosing = false;
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            this.start(path, window, cx);
+                        }
+                    }
+                    Ok(Ok(None)) => {} // Dismissing the native picker preserves the prior scan.
+                    Ok(Err(error)) => {
+                        this.session.status = format!("无法打开文件夹选择窗口：{error}")
+                    }
+                    Err(error) => this.session.status = format!("文件夹选择窗口已断开：{error}"),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn reset_projection(&mut self) {
+        self.map_parent = self.session.result.as_ref().map(|scan| scan.root);
+        self.tiles = self
+            .session
+            .result
+            .as_ref()
+            .map(|scan| footprint::project(scan, scan.root))
+            .unwrap_or_default();
+    }
+
+    fn select_node(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        self.session.select(id);
+        if let Some(scan) = &self.session.result {
+            if scan.nodes[id].kind == NodeKind::Directory && self.map_parent != Some(id) {
+                self.map_parent = Some(id);
+                self.tiles = footprint::project(scan, id);
+            }
+        }
+        cx.notify();
+    }
+
+    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        if let Some(path) = self.session.root_path.clone() {
+            self.start(path, window, cx);
         }
     }
 
-    fn busy(&self) -> bool {
-        self.receiver.is_some()
+    fn copy_path(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if let Some(scan) = &self.session.result {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                scan.path_for(id).display().to_string(),
+            ));
+            self.session.status = "已复制完整路径".into();
+            cx.notify();
+        }
     }
 
-    fn choose_folder(&mut self, ctx: &egui::Context) {
+    fn reveal(&mut self, id: NodeId, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
-        {
-            // Cocoa panels must be created from the UI thread, not the scanner.
-            let mut dialog = rfd::FileDialog::new().set_title("选择要分析的文件夹");
-            if let Some(root) = &self.root_path {
-                dialog = dialog.set_directory(root);
-            }
-            if let Some(path) = dialog.pick_folder() {
-                self.start(path, ctx);
+        if let Some(scan) = &self.session.result {
+            if let Err(error) = std::process::Command::new("/usr/bin/open")
+                .arg("-R")
+                .arg(scan.path_for(id))
+                .spawn()
+            {
+                self.session.status = format!("无法打开 Finder：{error}");
             }
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = ctx;
-            self.status = "此开发平台请在路径栏输入文件夹；macOS 提供原生选择窗口。".into();
+            let _ = id;
+            self.session.status = "Finder 功能仅适用于 macOS。".into();
         }
+        cx.notify();
     }
 
-    fn start(&mut self, path: PathBuf, ctx: &egui::Context) {
-        if self.busy() {
-            return;
-        }
-        self.path_text = path.display().to_string();
-        self.root_path = Some(path.clone());
-        self.result = None;
-        self.rows = VisibleTree::new();
-        self.query_changed = None;
-        self.applied_query.clear();
-        self.expanded = HashSet::new();
-        self.selected = None;
-        self.query.clear();
-        self.progress = None;
-        self.started = Some(Instant::now());
-        self.status = "正在扫描…".into();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let latest_progress = Arc::new(Mutex::new(None));
-        let worker_progress = Arc::clone(&latest_progress);
-        let context = ctx.clone();
-        let spawn = std::thread::Builder::new()
-            .name("disk-scanner".into())
-            .spawn(move || {
-                let result = scanner::scan(&path, &worker_cancel, |progress| {
-                    if let Ok(mut latest) = worker_progress.lock() {
-                        *latest = Some(progress);
-                    }
-                    context.request_repaint();
-                })
-                .map_err(|error| error.to_string());
-                let _ = sender.send(WorkerEvent::Finished(result));
-                context.request_repaint();
-            });
-        match spawn {
-            Ok(_) => {
-                self.latest_progress = Some(latest_progress);
-                self.cancel = Some(cancel);
-                self.receiver = Some(receiver);
-            }
-            Err(error) => {
-                self.status = format!("无法启动扫描：{error}");
-            }
-        }
-    }
-
-    fn poll(&mut self) {
-        if let Some(latest) = &self.latest_progress {
-            if let Ok(mut progress) = latest.lock() {
-                if let Some(progress) = progress.take() {
-                    self.progress = Some(progress);
-                }
-            }
-        }
-        let mut completed = false;
-        if let Some(receiver) = &self.receiver {
-            match receiver.try_recv() {
-                Ok(WorkerEvent::Finished(result)) => {
-                    match result {
-                        Ok(scan) => {
-                            let root = &scan.nodes[scan.root];
-                            self.status = if scan.cancelled {
-                                "扫描已取消，下方仅显示已扫描部分，不代表完整大小。".into()
-                            } else if root.issue_count > 0 {
-                                format!(
-                                    "扫描结束 · {} 处未能完整读取，统计可能偏小",
-                                    root.issue_count
-                                )
-                            } else {
-                                format!("扫描完成 · {:.1} 秒", scan.elapsed.as_secs_f64())
-                            };
-                            self.expanded.insert(scan.root);
-                            self.selected = Some(scan.root);
-                            self.result = Some(scan);
-                        }
-                        Err(error) => self.status = format!("扫描失败：{error}"),
-                    }
-                    completed = true;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.status = "扫描线程意外结束，请重新扫描。".into();
-                    completed = true;
-                }
-            }
-        }
-        if completed {
-            self.receiver = None;
-            self.cancel = None;
-            self.latest_progress = None;
-            if let Some(scan) = &mut self.result {
-                if self.sort != SortBy::Allocated {
-                    sort_tree(scan, self.sort);
-                }
-            }
-            self.rebuild_rows();
-        }
-    }
-
-    fn rebuild_rows(&mut self) {
-        self.query_changed = None;
-        self.applied_query.clone_from(&self.query);
-        if let Some(scan) = &self.result {
-            self.rows.rebuild(scan, &self.expanded, &self.query);
-        } else {
-            self.rows = VisibleTree::new();
-        }
-    }
-
-    fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("◈").size(29.0).color(ACCENT));
-            ui.label(RichText::new("Tree Lens").size(26.0).strong());
-            ui.label(RichText::new("磁盘空间，一目了然").color(MUTED));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("关于 / 统计说明").clicked() {
-                    self.show_about = true;
-                }
-            });
-        });
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            let busy = self.busy();
-            if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(RichText::new("选择文件夹").color(ACCENT)),
-                )
-                .clicked()
-            {
-                self.choose_folder(ctx);
-            }
-            let input = ui.add_enabled(
-                !busy,
-                egui::TextEdit::singleline(&mut self.path_text)
-                    .hint_text("输入绝对路径，例如 /Users/你的用户名/Downloads")
-                    .desired_width((ui.available_width() - 170.0).max(180.0)),
+    fn sidebar(&self, cx: &mut Context<Self>) -> Div {
+        let busy = self.session.busy() || self.choosing;
+        let mut nav = div()
+            .flex()
+            .flex_col()
+            .w(px(170.0))
+            .flex_shrink_0()
+            .p_4()
+            .gap_3()
+            .bg(rgb(0x0c131c))
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .mb_2()
+                    .child("WORKSPACE"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(0x173138))
+                    .text_color(rgb(CYAN))
+                    .child(Icon::new(IconName::Folder).size_4())
+                    .child("空间总览"),
+            )
+            .child(
+                div()
+                    .mt_5()
+                    .mb_1()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("快速扫描"),
             );
-            let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui
-                .add_enabled(
-                    !busy && !self.path_text.trim().is_empty(),
-                    egui::Button::new("扫描"),
-                )
-                .clicked()
-                || (enter && !busy && !self.path_text.trim().is_empty())
-            {
-                self.start(expand_home(&self.path_text), ctx);
-            }
-            if busy {
-                let cancelling = self
-                    .cancel
-                    .as_ref()
-                    .is_some_and(|c| c.load(Ordering::Relaxed));
-                if ui
-                    .add_enabled(
-                        !cancelling,
-                        egui::Button::new(if cancelling { "取消中…" } else { "取消" }),
-                    )
-                    .clicked()
-                {
-                    if let Some(cancel) = &self.cancel {
-                        cancel.store(true, Ordering::Relaxed);
-                    }
-                }
-            } else if ui
-                .add_enabled(self.root_path.is_some(), egui::Button::new("刷新"))
-                .clicked()
-            {
-                if let Some(path) = self.root_path.clone() {
-                    self.start(path, ctx);
-                }
-            }
-        });
+        for (index, (label, suffix)) in [
+            ("主文件夹", ""),
+            ("下载", "Downloads"),
+            ("桌面", "Desktop"),
+            ("文稿", "Documents"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            nav = nav.child(
+                Button::new(("shortcut", index))
+                    .ghost()
+                    .label(label)
+                    .icon(IconName::Folder)
+                    .disabled(busy)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(home) = std::env::var_os("HOME") {
+                            this.start(PathBuf::from(home).join(suffix), window, cx);
+                        }
+                    })),
+            );
+        }
+        nav.child(div().flex_1())
+            .child(
+                div()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(div().text_color(rgb(LIME)).mb_2().child("只读 · 本地运行"))
+                    .child("不读取文件内容，不上传扫描结果。"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x63778c))
+                    .child("GPUI KIT / 0.3"),
+            )
     }
 
-    fn summaries(&self, ui: &mut egui::Ui) {
-        let (allocated, logical, files, dirs) = if let Some(scan) = &self.result {
-            let root = &scan.nodes[scan.root];
-            (
-                root.total_allocated_bytes,
-                root.total_logical_bytes,
-                root.file_count,
-                root.directory_count.saturating_sub(1),
+    fn toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let busy = self.session.busy();
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(26.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("让空间，看得见。"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(MUTED))
+                                    .child("从文件夹到每个字节，找到真正占用空间的地方。"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgb(0x354b40))
+                            .text_xs()
+                            .text_color(rgb(LIME))
+                            .child("●  READ ONLY"),
+                    ),
             )
-        } else if let Some(progress) = &self.progress {
-            (
-                progress.allocated_bytes,
-                progress.logical_bytes,
-                progress.files,
-                progress.directories.saturating_sub(1),
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("open-folder")
+                            .primary()
+                            .icon(IconName::FolderOpen)
+                            .label("选择文件夹")
+                            .disabled(busy || self.choosing)
+                            .tooltip("选择文件夹 · ⌘O")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.choose_folder(window, cx)),
+                            ),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.path_input)
+                                .disabled(busy)
+                                .aria_label("扫描文件夹路径"),
+                        ),
+                    )
+                    .child(
+                        Button::new("scan-path")
+                            .label("扫描")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let path = this.path_input.read(cx).value().to_string();
+                                if !path.trim().is_empty() {
+                                    this.start(expand_home(&path), window, cx);
+                                }
+                            })),
+                    )
+                    .child(if busy {
+                        Button::new("cancel")
+                            .label(if self.session.cancelling() {
+                                "取消中…"
+                            } else {
+                                "取消"
+                            })
+                            .disabled(self.session.cancelling())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.session.cancel();
+                                cx.notify();
+                            }))
+                    } else {
+                        Button::new("refresh")
+                            .icon(IconName::RotateCw)
+                            .tooltip("重新扫描 · ⌘R")
+                            .disabled(self.session.root_path.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx)))
+                    }),
             )
-        } else {
-            (0, 0, 0, 0)
-        };
-        let partial = self.busy()
-            || self
-                .result
-                .as_ref()
-                .is_some_and(|s| s.cancelled || s.nodes[s.root].issue_count > 0);
-        let cards = [
+    }
+
+    fn summaries(&self) -> Div {
+        let (allocated, logical, files, folders) = self.session.summary();
+        let labels = [
             (
-                if partial {
+                if self.session.partial() {
                     "已统计磁盘占用"
                 } else {
                     "磁盘占用"
                 },
                 format_bytes(allocated),
+                "ALLOCATED",
+                CYAN,
             ),
-            ("逻辑大小", format_bytes(logical)),
-            ("文件", files.to_string()),
-            ("子文件夹", dirs.to_string()),
+            ("逻辑大小", format_bytes(logical), "LOGICAL SIZE", 0x9dc5ff),
+            ("文件", format_count(files), "FILES INDEXED", 0xc4a4f7),
+            ("子文件夹", format_count(folders), "DIRECTORIES", LIME),
         ];
-        ui.columns(4, |columns| {
-            for (column, (title, value)) in columns.iter_mut().zip(cards) {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(31, 37, 47))
-                    .corner_radius(9)
-                    .inner_margin(16)
-                    .show(column, |ui| {
-                        ui.set_min_width((ui.available_width() - 1.0).max(60.0));
-                        ui.label(RichText::new(title).color(MUTED).size(13.0));
-                        ui.label(RichText::new(value).size(24.0).strong().color(ACCENT));
-                    });
-            }
-        });
-    }
-
-    fn tree(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("文件夹树").strong().size(17.0));
-            let changed = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("按名称筛选…")
-                        .desired_width(210.0),
-                )
-                .changed();
-            if changed {
-                self.query_changed = Some(Instant::now());
-            }
-            if !self.query.is_empty() && ui.small_button("清除").clicked() {
-                self.query.clear();
-                self.rebuild_rows();
-            }
-            if ui
-                .add_enabled(self.query.trim().is_empty(), egui::Button::new("收起全部"))
-                .clicked()
-            {
-                self.expanded = HashSet::new();
-                if let Some(scan) = &self.result {
-                    self.expanded.insert(scan.root);
-                }
-                self.rebuild_rows();
-            }
-            if ui
-                .add_enabled(self.query.trim().is_empty(), egui::Button::new("展开一级"))
-                .clicked()
-            {
-                if let Some(scan) = &self.result {
-                    self.rows.expand_one_level(scan, &mut self.expanded);
-                }
-                self.rebuild_rows();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("{} 行", self.rows.len())).color(MUTED));
-            });
-        });
-        ui.add_space(7.0);
-        if self.result.is_none() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(85.0);
-                if self.busy() {
-                    ui.spinner();
-                }
-                ui.label(
-                    RichText::new(if self.busy() {
-                        "正在读取文件信息"
-                    } else {
-                        "从一个文件夹开始"
-                    })
-                    .size(23.0),
-                );
-                ui.label(
-                    RichText::new(if self.busy() {
-                        "扫描在后台进行，你可以随时取消。"
-                    } else {
-                        "点击“选择文件夹”，或将文件夹拖到窗口中。"
-                    })
-                    .color(MUTED),
-                );
-                ui.add_space(12.0);
-                ui.label(
-                    RichText::new("只读分析 · 不删除文件 · 不跟随符号链接")
-                        .small()
-                        .color(MUTED),
-                );
-            });
-            return;
-        }
-        let width = ui.available_width().max(1010.0);
-        let name_width = width - 610.0;
-        let mut next_sort = None;
-        let mut toggle = None;
-        let mut selection = None;
-        let mut reveal = None;
-        egui::ScrollArea::horizontal()
-            .id_salt("horizontal-tree")
-            .show(ui, |ui| {
-                ui.set_width(width);
-                ui.horizontal(|ui| {
-                    for (label, column_width, sort) in [
-                        ("名称", name_width, SortBy::Name),
-                        ("磁盘占用 ↓", 125.0, SortBy::Allocated),
-                        ("逻辑大小 ↓", 125.0, SortBy::Logical),
-                        ("占父级", 190.0, self.sort),
-                        ("文件数 ↓", 120.0, SortBy::Files),
-                    ] {
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(column_width, 27.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .selectable_label(
-                                        self.sort == sort && label != "占父级",
-                                        RichText::new(label).color(MUTED),
-                                    )
-                                    .clicked()
-                                    && label != "占父级"
-                                {
-                                    next_sort = Some(sort);
-                                }
-                            },
-                        );
-                    }
-                });
-                ui.separator();
-                let scan = self.result.as_ref().expect("result checked above");
-                egui::ScrollArea::vertical()
-                    .id_salt("vertical-tree")
-                    .auto_shrink([false, false])
-                    .show_rows(ui, ROW_HEIGHT, self.rows.len(), |ui, range| {
-                        let first = range.start;
-                        for (offset, (id, depth)) in
-                            self.rows.rows(scan, range).into_iter().enumerate()
-                        {
-                            let index = first + offset;
-                            let node = &scan.nodes[id];
-                            let is_dir = node.kind == NodeKind::Directory;
-                            let is_open = self.expanded.contains(&id)
-                                || !self.applied_query.trim().is_empty();
-                            let fill = if self.selected == Some(id) {
-                                Color32::from_rgb(36, 63, 65)
-                            } else if index % 2 == 0 {
-                                Color32::from_rgb(26, 31, 40)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            let (row_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(width, ROW_HEIGHT),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(row_rect, 4.0, fill);
-                            let mut child = ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(row_rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                            );
-                            child.spacing_mut().item_spacing.y = 0.0;
-                            child.allocate_ui_with_layout(
-                                Vec2::new(name_width, ROW_HEIGHT),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.add_space((depth.min(20) as f32) * 14.0);
-                                    if is_dir && !node.children.is_empty() {
-                                        if ui
-                                            .add_sized(
-                                                [18.0, 24.0],
-                                                egui::Button::new(if is_open {
-                                                    "▾"
-                                                } else {
-                                                    "▸"
-                                                })
-                                                .frame(false),
-                                            )
-                                            .clicked()
-                                            && self.applied_query.trim().is_empty()
-                                        {
-                                            toggle = Some(id);
-                                        }
-                                    } else {
-                                        ui.add_space(18.0);
-                                    }
-                                    let icon = match node.kind {
-                                        NodeKind::Directory => "▰",
-                                        NodeKind::Symlink => "↗",
-                                        NodeKind::File => "▪",
-                                        NodeKind::Other => "·",
-                                    };
-                                    ui.label(RichText::new(icon).color(if is_dir {
-                                        ACCENT
-                                    } else {
-                                        MUTED
-                                    }));
-                                    let label = format!(
-                                        "{}{}{}",
-                                        node.display_name(),
-                                        if node.hard_link_duplicate {
-                                            "  [硬链接]"
-                                        } else {
-                                            ""
-                                        },
-                                        if node.issue_count > 0 { "  ⚠" } else { "" }
-                                    );
-                                    let response = ui.add(
-                                        egui::Label::new(RichText::new(label).color(
-                                            if node.error.is_some() {
-                                                WARN
-                                            } else {
-                                                Color32::from_rgb(223, 229, 236)
-                                            },
-                                        ))
-                                        .truncate()
-                                        .sense(egui::Sense::click()),
-                                    );
-                                    if response.clicked() {
-                                        selection = Some(id);
-                                    }
-                                    if response.double_clicked()
-                                        && is_dir
-                                        && self.applied_query.trim().is_empty()
-                                    {
-                                        toggle = Some(id);
-                                    }
-                                    response.clone().on_hover_ui(|ui| {
-                                        ui.label(scan.path_for(id).display().to_string());
-                                        if let Some(error) = &node.error {
-                                            ui.label(error.as_ref());
-                                        }
-                                    });
-                                    response.context_menu(|ui| {
-                                        if ui.button("复制完整路径").clicked() {
-                                            ui.ctx()
-                                                .copy_text(scan.path_for(id).display().to_string());
-                                            ui.close_menu();
-                                        }
-                                        #[cfg(target_os = "macos")]
-                                        if ui.button("在 Finder 中显示").clicked() {
-                                            reveal = Some(scan.path_for(id));
-                                            ui.close_menu();
-                                        }
-                                    });
-                                },
-                            );
-                            column_value(
-                                &mut child,
-                                125.0,
-                                format_bytes(node.total_allocated_bytes),
-                                ACCENT,
-                            );
-                            column_value(
-                                &mut child,
-                                125.0,
-                                format_bytes(node.total_logical_bytes),
-                                MUTED,
-                            );
-                            let parent_total = node
-                                .parent
-                                .map(|p| scan.nodes[p].total_allocated_bytes)
-                                .unwrap_or(node.total_allocated_bytes);
-                            let fraction = if parent_total == 0 {
-                                0.0
-                            } else {
-                                node.total_allocated_bytes as f64 / parent_total as f64
-                            };
-                            child.allocate_ui_with_layout(
-                                Vec2::new(190.0, ROW_HEIGHT),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.add(
-                                        egui::ProgressBar::new(fraction as f32)
-                                            .desired_width(112.0)
-                                            .desired_height(7.0)
-                                            .fill(ACCENT),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!("{:.1}%", fraction * 100.0))
-                                            .small()
-                                            .color(MUTED),
-                                    );
-                                },
-                            );
-                            column_value(&mut child, 120.0, node.file_count.to_string(), MUTED);
-                        }
-                    });
-            });
-        if let Some(id) = toggle {
-            if !self.expanded.remove(&id) {
-                self.expanded.insert(id);
-            }
-            self.rebuild_rows();
-        }
-        if let Some(sort) = next_sort {
-            if self.sort != sort {
-                self.sort = sort;
-                if let Some(scan) = &mut self.result {
-                    sort_tree(scan, sort);
-                }
-                self.rebuild_rows();
-            }
-        }
-        if let Some(id) = selection {
-            self.selected = Some(id);
-        }
-        // Keep the no-op Linux type explicit so the development build also compiles.
-        let reveal: Option<PathBuf> = reveal.take();
-        if let Some(path) = reveal {
-            reveal_in_finder(path, &mut self.status);
-        }
-    }
-
-    fn dialogs(&mut self, ctx: &egui::Context) {
-        egui::Window::new("读取问题")
-            .open(&mut self.show_issues)
-            .default_width(700.0)
-            .show(ctx, |ui| {
-                ui.label("无法访问的内容没有纳入完整统计。应用不会请求管理员权限或修改权限。");
-                ui.label(
-                    "macOS 系统设置 → 隐私与安全性 → 完全磁盘访问权限，可由你自行决定是否授权。",
-                );
-                if let Some(scan) = &self.result {
-                    let count = scan.nodes[scan.root].issue_count;
-                    ui.label(format!("共 {count} 处问题，以下最多展示 500 条。"));
-                    egui::ScrollArea::both().max_height(430.0).show(ui, |ui| {
-                        for issue in &scan.issues {
-                            ui.label(RichText::new(issue.path.display().to_string()).color(WARN));
-                            ui.label(&issue.message);
-                            ui.separator();
-                        }
-                    });
-                }
-            });
-        egui::Window::new("关于 Tree Lens").open(&mut self.show_about).default_width(530.0).show(ctx, |ui| {
-            ui.heading("Tree Lens 0.2");
-            ui.label("一个用 Rust 编写的只读磁盘空间分析工具，当前面向 macOS。");
-            ui.separator();
-            for text in [
-                "磁盘占用：文件系统报告的已分配块数 × 512，包括文件夹元数据。",
-                "逻辑大小：文件内容长度；文件夹为子项累计，不计文件夹本身的逻辑长度。",
-                "同一扫描中的硬链接只计算一次磁盘占用，逻辑大小按路径分别计算。哪条链接承担占用取决于扫描顺序。",
-                "不跟随符号链接，也不进入其他设备的挂载点；隐藏文件和 .app 包都会扫描。",
-                "APFS 克隆、压缩、快照及共享块可能让统计与真正可释放空间不同；此数字不是删除后必然可回收的容量。",
-                "扫描不会读取文件内容，不主动下载 iCloud 内容。若系统仍需访问云端元数据，耗时由系统决定。",
-                "文件扫描期间仍可能变化；报错或取消后，结果仅代表已读取部分。所有单位使用 1024 进制。",
-                "此版本不提供删除、移动或清理操作。⌘O 选择文件夹；⌘R 刷新。",
-            ] { ui.label(text); ui.add_space(5.0); }
-        });
-    }
-}
-
-impl eframe::App for TreeLensApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll();
-        if self
-            .query_changed
-            .is_some_and(|changed| changed.elapsed() >= Duration::from_millis(180))
-        {
-            self.rebuild_rows();
-        }
-        if let Some(path) = self.initial_path.take() {
-            self.start(path, ctx);
-        }
-        if !self.busy() {
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
-                self.choose_folder(ctx);
-            }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::R)) {
-                if let Some(path) = self.root_path.clone() {
-                    self.start(path, ctx);
-                }
-            }
-            let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-            if let Some(path) = dropped {
-                self.start(path, ctx);
-            }
-        }
-        egui::TopBottomPanel::top("header")
-            .frame(
-                egui::Frame::new()
-                    .inner_margin(22)
-                    .fill(Color32::from_rgb(22, 26, 34)),
-            )
-            .show(ctx, |ui| {
-                self.header(ui, ctx);
-            });
-        egui::TopBottomPanel::bottom("status")
-            .frame(
-                egui::Frame::new()
-                    .inner_margin(12)
-                    .fill(Color32::from_rgb(26, 31, 40)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if self.busy() {
-                        ui.spinner();
-                    }
-                    let status = if self.busy() {
-                        let entries = self.progress.as_ref().map_or(0, |p| p.entries);
-                        let seconds = self.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
-                        format!("已检查 {entries} 个项目 · {seconds:.1} 秒")
-                    } else {
-                        self.status.clone()
-                    };
-                    ui.label(RichText::new(status).color(MUTED));
-                    if self
-                        .result
-                        .as_ref()
-                        .is_some_and(|s| s.nodes[s.root].issue_count > 0)
-                        && ui.button("查看问题").clicked()
-                    {
-                        self.show_issues = true;
-                    }
-                });
-                let path = if self.busy() {
-                    self.progress.as_ref().map(|p| p.current_path.clone())
-                } else {
-                    self.result
-                        .as_ref()
-                        .and_then(|s| self.selected.map(|id| s.path_for(id)))
-                };
-                if let Some(path) = path {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(path.display().to_string())
-                                .small()
-                                .color(MUTED),
-                        )
-                        .truncate(),
+        div()
+            .flex()
+            .gap_3()
+            .children(labels.into_iter().map(|(label, value, detail, color)| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .p_3()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(linear_gradient(
+                        140.0,
+                        linear_color_stop(rgb(0x172430), 0.0),
+                        linear_color_stop(rgb(PANEL), 1.0),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().text_color(rgb(MUTED)).child(label))
+                            .child(div().size(px(6.0)).rounded_full().bg(rgb(color))),
                     )
-                    .on_hover_text(path.display().to_string());
-                }
-            });
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .inner_margin(22)
-                    .fill(Color32::from_rgb(22, 26, 34)),
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_size(px(26.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(color))
+                            .child(value),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_size(px(9.0))
+                            .text_color(rgb(0x6f879e))
+                            .child(detail),
+                    )
+            }))
+    }
+
+    fn footprint(&self, cx: &mut Context<Self>) -> Div {
+        let parent = self.map_parent.and_then(|id| {
+            self.session
+                .result
+                .as_ref()
+                .map(|scan| (id, scan.nodes[id].display_name().into_owned()))
+        });
+        let mut chart = div()
+            .relative()
+            .w_full()
+            .h(px(124.0))
+            .rounded_lg()
+            .overflow_hidden()
+            .bg(rgb(0x0b131d));
+        for (index, tile) in self.tiles.iter().enumerate() {
+            let [x, y, w, h] = tile.rect;
+            let (bg, fg) = PALETTE[index % PALETTE.len()];
+            let id = tile.node;
+            let tooltip = format!("{} · {}", tile.label, format_bytes(tile.bytes));
+            chart = chart.child(
+                div()
+                    .id(("tile", index))
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .absolute()
+                    .left(relative(x))
+                    .top(relative(y))
+                    .w(relative(w))
+                    .h(relative(h))
+                    .p(px(2.0))
+                    .child(
+                        div()
+                            .size_full()
+                            .overflow_hidden()
+                            .rounded_lg()
+                            .p(px(if h < 0.35 { 6.0 } else { 12.0 }))
+                            .border_1()
+                            .border_color(rgb(fg).opacity(0.22))
+                            .bg(linear_gradient(
+                                135.0,
+                                linear_color_stop(rgb(bg), 0.0),
+                                linear_color_stop(rgb(bg).opacity(0.65), 1.0),
+                            ))
+                            .hover(|style| style.border_color(rgb(fg)).bg(rgb(bg)))
+                            .when(id.is_some(), |el| el.cursor_pointer())
+                            .when(h > 0.18 && w > 0.04, |el| {
+                                el.child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(fg))
+                                        .child(tile.label.clone()),
+                                )
+                            })
+                            .when(h > 0.3 && w > 0.08, |el| {
+                                el.child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT))
+                                        .child(format_bytes(tile.bytes)),
+                                )
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(id) = id {
+                            this.select_node(id, cx);
+                        }
+                    })),
+            );
+        }
+        if self.tiles.is_empty() {
+            chart = chart.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(if self.session.busy() {
+                        "正在绘制你的空间地图…"
+                    } else if self.session.result.is_some() {
+                        "此目录暂无已分配空间"
+                    } else {
+                        "扫描后，这里将显示真实的空间分布"
+                    }),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("空间地图"))
+                            .child(
+                                div().text_xs().text_color(rgb(MUTED)).child(
+                                    parent
+                                        .as_ref()
+                                        .map(|(_, name)| name.clone())
+                                        .unwrap_or_else(|| "等待扫描".into()),
+                                ),
+                            ),
+                    )
+                    .child(
+                        Button::new("map-root")
+                            .ghost()
+                            .xsmall()
+                            .label("返回根目录")
+                            .disabled(self.session.result.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.reset_projection();
+                                cx.notify();
+                            })),
+                    ),
             )
-            .show(ctx, |ui| {
-                self.summaries(ui);
-                ui.add_space(22.0);
-                self.tree(ui);
-            });
-        self.dialogs(ctx);
-        if self.busy() || self.query_changed.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
+            .child(chart)
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(MUTED))
+                    .child("面积 ∝ 已分配空间 · 点击目录深入查看 · 最多显示 11 项，其余合并"),
+            )
     }
-}
 
-impl Drop for TreeLensApp {
-    fn drop(&mut self) {
-        if let Some(cancel) = &self.cancel {
-            cancel.store(true, Ordering::Relaxed);
-        }
+    fn tree_panel(&self, cx: &mut Context<Self>) -> Div {
+        let filtered = !self.session.query.trim().is_empty();
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .rounded_xl()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("文件树"))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                "{} 行",
+                                format_count(self.session.rows.len() as u64)
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div().w(px(190.0)).child(
+                                    Input::new(&self.search_input)
+                                        .small()
+                                        .cleanable(true)
+                                        .prefix(Icon::new(IconName::Search).size_4())
+                                        .aria_label("按文件名筛选"),
+                                ),
+                            )
+                            .child(
+                                Button::new("collapse")
+                                    .ghost()
+                                    .small()
+                                    .label("收起")
+                                    .disabled(filtered)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.session.collapse_all();
+                                        this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("expand")
+                                    .ghost()
+                                    .small()
+                                    .label("展开一级")
+                                    .disabled(filtered)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.session.expand_one_level();
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(self.tree_header(cx))
+            .child(if self.session.result.is_some() {
+                if self.session.rows.is_empty() {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(MUTED))
+                        .child("没有匹配的名称，试试其他关键词。")
+                        .into_any_element()
+                } else {
+                    uniform_list(
+                        "file-tree",
+                        self.session.rows.len(),
+                        cx.processor(|this, range: Range<usize>, _, cx| {
+                            let rows = this
+                                .session
+                                .result
+                                .as_ref()
+                                .map(|scan| this.session.rows.rows(scan, range))
+                                .unwrap_or_default();
+                            rows.into_iter()
+                                .map(|(id, depth)| this.tree_row(id, depth, cx))
+                                .collect()
+                        }),
+                    )
+                    .track_scroll(&self.scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .into_any_element()
+                }
+            } else {
+                self.empty_state(cx).into_any_element()
+            })
     }
-}
 
-fn column_value(ui: &mut egui::Ui, width: f32, value: String, color: Color32) {
-    ui.allocate_ui_with_layout(
-        Vec2::new(width, ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.label(RichText::new(value).monospace().color(color));
-        },
-    );
-}
-
-fn expand_home(input: &str) -> PathBuf {
-    let input = input.trim();
-    if input == "~" || input.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(input.trim_start_matches('~').trim_start_matches('/'));
-        }
+    fn tree_header(&self, cx: &mut Context<Self>) -> Div {
+        let sort = self.session.sort;
+        div()
+            .flex()
+            .items_center()
+            .h(px(34.0))
+            .px_3()
+            .gap_2()
+            .bg(rgb(0x0e1620))
+            .border_y_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .child(sort_button("名称", SortBy::Name, sort, "sort-name", cx)),
+            )
+            .child(div().w(px(110.0)).flex().items_center().child(sort_button(
+                "磁盘占用",
+                SortBy::Allocated,
+                sort,
+                "sort-allocated",
+                cx,
+            )))
+            .child(div().w(px(105.0)).flex().items_center().child(sort_button(
+                "逻辑大小",
+                SortBy::Logical,
+                sort,
+                "sort-logical",
+                cx,
+            )))
+            .child(
+                div()
+                    .w(px(128.0))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("占父级"),
+            )
+            .child(div().w(px(62.0)).flex().items_center().child(sort_button(
+                "文件数",
+                SortBy::Files,
+                sort,
+                "sort-files",
+                cx,
+            )))
     }
-    PathBuf::from(input)
-}
 
-fn reveal_in_finder(path: PathBuf, status: &mut String) {
-    #[cfg(target_os = "macos")]
-    if let Err(error) = std::process::Command::new("/usr/bin/open")
-        .arg("-R")
-        .arg(path)
-        .spawn()
-    {
-        *status = format!("无法打开 Finder：{error}");
+    fn tree_row(&self, id: NodeId, depth: usize, cx: &mut Context<Self>) -> AnyElement {
+        let scan = self
+            .session
+            .result
+            .as_ref()
+            .expect("only render rows for a scan");
+        let node = &scan.nodes[id];
+        let directory = node.kind == NodeKind::Directory;
+        let open =
+            self.session.expanded.contains(&id) || !self.session.applied_query().trim().is_empty();
+        let parent_bytes = node
+            .parent
+            .map(|p| scan.nodes[p].total_allocated_bytes)
+            .unwrap_or(node.total_allocated_bytes);
+        let fraction = if parent_bytes == 0 {
+            0.0
+        } else {
+            (node.total_allocated_bytes as f64 / parent_bytes as f64).clamp(0.0, 1.0) as f32
+        };
+        let selected = self.session.selected == Some(id);
+        let view = cx.entity().downgrade();
+        let generation = self.generation;
+        let icon = match node.kind {
+            NodeKind::Directory => IconName::Folder,
+            NodeKind::Symlink => IconName::ExternalLink,
+            _ => IconName::File,
+        };
+        div()
+            .id(("row", id))
+            .w_full()
+            .test_support()
+            .role(Role::TreeItem)
+            .aria_label(node.display_name().into_owned())
+            .aria_selected(selected)
+            .aria_level(depth + 1)
+            .when(directory, |el| el.aria_expanded(open))
+            .flex()
+            .items_center()
+            .h(px(40.0))
+            .px_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(rgb(0x182430))
+            .bg(rgb(if selected { 0x18353a } else { PANEL }))
+            .hover(|style| style.bg(rgb(0x1b2a37)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                this.select_node(id, cx);
+                if event.click_count() == 2 {
+                    this.session.toggle(id);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pl(px(depth.min(18) as f32 * 14.0))
+                    .child(div().id(("chevron", id)).w(px(16.0)).flex_shrink_0().when(
+                        directory && !node.children.is_empty(),
+                        |el| {
+                            el.child(
+                                Icon::new(if open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size_3()
+                                .text_color(rgb(MUTED)),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.session.toggle(id);
+                                    cx.notify();
+                                },
+                            ))
+                        },
+                    ))
+                    .child(Icon::new(icon).size_4().text_color(rgb(if directory {
+                        CYAN
+                    } else {
+                        0x829bb4
+                    })))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(if node.issue_count > 0 { AMBER } else { TEXT }))
+                            .child(format!(
+                                "{}{}{}",
+                                node.display_name(),
+                                if node.hard_link_duplicate {
+                                    " · 硬链接"
+                                } else {
+                                    ""
+                                },
+                                if node.issue_count > 0 { " ⚠" } else { "" }
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(110.0))
+                    .text_sm()
+                    .text_color(rgb(CYAN))
+                    .child(format_bytes(node.total_allocated_bytes)),
+            )
+            .child(
+                div()
+                    .w(px(105.0))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format_bytes(node.total_logical_bytes)),
+            )
+            .child(
+                div()
+                    .w(px(128.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(74.0))
+                            .h(px(5.0))
+                            .rounded_full()
+                            .bg(rgb(0x253540))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(fraction))
+                                    .rounded_full()
+                                    .bg(rgb(if selected { LIME } else { CYAN })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(MUTED))
+                            .child(format!("{:.0}%", fraction * 100.0)),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(62.0))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format_count(node.file_count)),
+            )
+            .context_menu(move |menu, _, _| {
+                let copy_view = view.clone();
+                let reveal_view = view.clone();
+                menu.item(
+                    PopupMenuItem::new("复制完整路径").on_click(move |_, _, cx| {
+                        let _ = copy_view.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.copy_path(id, cx);
+                            }
+                        });
+                    }),
+                )
+                .when(cfg!(target_os = "macos"), |menu| {
+                    menu.item(
+                        PopupMenuItem::new("在 Finder 中显示").on_click(move |_, _, cx| {
+                            let _ = reveal_view.update(cx, |this, cx| {
+                                if this.generation == generation {
+                                    this.reveal(id, cx);
+                                }
+                            });
+                        }),
+                    )
+                })
+            })
+            .into_any_element()
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (path, status);
-    }
-}
 
-fn install_fonts(ctx: &egui::Context) {
-    let candidates = [
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    ];
-    let mut fonts = egui::FontDefinitions::default();
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "system-cjk".into(),
-                Arc::new(egui::FontData::from_owned(bytes)),
+    fn empty_state(&self, cx: &mut Context<Self>) -> Div {
+        let busy = self.session.busy();
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .p_5()
+            .child(
+                div()
+                    .size(px(56.0))
+                    .rounded_xl()
+                    .bg(rgb(0x173a3b))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if busy {
+                        Spinner::new().color(rgb(CYAN).into()).into_any_element()
+                    } else {
+                        Icon::new(IconName::FolderOpen)
+                            .size_8()
+                            .text_color(rgb(CYAN))
+                            .into_any_element()
+                    }),
+            )
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(if busy {
+                        "正在发现你的空间"
+                    } else {
+                        "每个文件，都有自己的位置"
+                    }),
+            )
+            .child(div().text_sm().text_color(rgb(MUTED)).child(if busy {
+                "扫描在后台进行，可随时取消。"
+            } else {
+                "选择文件夹，或将它拖入窗口开始分析。"
+            }))
+            .when(!busy, |el| {
+                el.child(
+                    Button::new("empty-open")
+                        .primary()
+                        .label("开始探索")
+                        .disabled(self.choosing)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.choose_folder(window, cx)),
+                        ),
+                )
+            })
+    }
+
+    fn inspector(&self, cx: &mut Context<Self>) -> Div {
+        let mut panel = div()
+            .w(px(220.0))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(MUTED))
+                    .child("INSPECTOR / 项目详情"),
             );
-            fonts
-                .families
-                .get_mut(&FontFamily::Proportional)
-                .unwrap()
-                .push("system-cjk".into());
-            fonts
-                .families
-                .get_mut(&FontFamily::Monospace)
-                .unwrap()
-                .push("system-cjk".into());
-            break;
-        }
-    }
-    ctx.set_fonts(fonts);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    fn wait_for_scan(app: &mut TreeLensApp) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while app.busy() && Instant::now() < deadline {
-            app.poll();
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(!app.busy(), "scan did not complete in five seconds");
-    }
-
-    #[test]
-    fn headless_ui_renders_empty_and_results_at_multiple_sizes() {
-        let ctx = egui::Context::default();
-        let mut app = TreeLensApp::with_context(&ctx, None);
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        for loaded in [false, true] {
-            if loaded {
-                app.start(path.clone(), &ctx);
-                wait_for_scan(&mut app);
-            }
-            for size in [[1180.0, 780.0], [820.0, 560.0]] {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        Vec2::from(size),
-                    )),
-                    ..Default::default()
-                };
-                let output = ctx.run(input, |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        app.header(ui, ctx);
-                        app.summaries(ui);
-                        app.tree(ui);
-                    });
-                    app.dialogs(ctx);
+        if let Some((scan, id)) = self.session.result.as_ref().zip(self.session.selected) {
+            let node = &scan.nodes[id];
+            panel = panel
+                .child(
+                    Icon::new(if node.kind == NodeKind::Directory {
+                        IconName::FolderOpen
+                    } else {
+                        IconName::File
+                    })
+                    .size_8()
+                    .text_color(rgb(CYAN)),
+                )
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .truncate()
+                        .child(node.display_name().into_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(px(28.0))
+                        .text_color(rgb(CYAN))
+                        .child(format_bytes(node.total_allocated_bytes)),
+                )
+                .child(div().text_xs().text_color(rgb(MUTED)).child("已分配空间"))
+                .child(detail("逻辑大小", format_bytes(node.total_logical_bytes)))
+                .child(detail("文件", format_count(node.file_count)))
+                .child(detail(
+                    "子文件夹",
+                    format_count(
+                        node.directory_count
+                            .saturating_sub(u64::from(node.kind == NodeKind::Directory)),
+                    ),
+                ))
+                .child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("完整路径"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .overflow_hidden()
+                        .child(scan.path_for(id).display().to_string()),
+                )
+                .when(node.hard_link_duplicate, |panel| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(AMBER))
+                            .child("硬链接：已在其他路径计入分配空间。"),
+                    )
+                })
+                .when(node.issue_count > 0, |panel| {
+                    panel.child(div().text_xs().text_color(rgb(AMBER)).child(format!(
+                        "包含 {} 处读取问题，统计可能偏小。",
+                        node.issue_count
+                    )))
+                })
+                .child(
+                    Button::new("copy-selected")
+                        .label("复制路径")
+                        .icon(IconName::Copy)
+                        .on_click(cx.listener(move |this, _, _, cx| this.copy_path(id, cx))),
+                )
+                .when(cfg!(target_os = "macos"), |panel| {
+                    panel.child(
+                        Button::new("reveal-selected")
+                            .label("在 Finder 中显示")
+                            .icon(IconName::ExternalLink)
+                            .on_click(cx.listener(move |this, _, _, cx| this.reveal(id, cx))),
+                    )
                 });
-                assert!(!output.shapes.is_empty());
-                let meshes = ctx.tessellate(output.shapes, output.pixels_per_point);
-                assert!(!meshes.is_empty());
-            }
-        }
-        app.query = "scanner".into();
-        app.rebuild_rows();
-        assert_eq!(app.rows.len(), 2);
-        app.query.clear();
-        app.expanded.clear();
-        app.rebuild_rows();
-        assert_eq!(app.rows.len(), 1);
-    }
-
-    #[test]
-    fn failed_scan_can_be_retried_and_duplicate_start_is_ignored() {
-        let ctx = egui::Context::default();
-        let mut app = TreeLensApp::with_context(&ctx, None);
-        let missing =
-            std::env::temp_dir().join(format!("tree-lens-missing-{}", std::process::id()));
-        assert!(!missing.exists());
-        app.start(missing, &ctx);
-        let ignored = PathBuf::from("this-second-request-must-not-start");
-        app.start(ignored.clone(), &ctx);
-        assert_ne!(app.root_path, Some(ignored));
-        wait_for_scan(&mut app);
-        assert!(app.result.is_none());
-        assert!(app.status.starts_with("扫描失败"));
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        app.start(directory, &ctx);
-        wait_for_scan(&mut app);
-        assert!(app.result.is_some());
-        assert!(!app.rows.is_empty());
-        assert!(app.cancel.is_none());
-    }
-
-    #[test]
-    fn input_paths_and_font_fallback_are_available() {
-        assert_eq!(expand_home(" /tmp/test "), PathBuf::from("/tmp/test"));
-        if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(expand_home("~"), PathBuf::from(&home));
-            assert_eq!(
-                expand_home("~/Downloads"),
-                PathBuf::from(home).join("Downloads")
+        } else {
+            panel = panel.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("选择文件树中的项目，在这里查看详细信息。"),
             );
         }
-        assert!(fs::metadata(env!("CARGO_MANIFEST_DIR")).unwrap().is_dir());
-    }
-
-    #[test]
-    fn progress_is_coalesced_in_one_slot() {
-        let ctx = egui::Context::default();
-        let mut app = TreeLensApp::with_context(&ctx, None);
-        let latest = Arc::new(Mutex::new(None));
-        app.latest_progress = Some(Arc::clone(&latest));
-        for entries in 0..10_000 {
-            *latest.lock().unwrap() = Some(ScanProgress {
-                entries,
-                ..Default::default()
-            });
-        }
-        app.poll();
-        assert_eq!(app.progress.as_ref().unwrap().entries, 9_999);
-        assert!(latest.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn gui_virtualizes_a_hundred_thousand_items() {
-        let ctx = egui::Context::default();
-        let mut app = TreeLensApp::with_context(&ctx, None);
-        let mut scan = scanner::scan(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .as_path(),
-            &AtomicBool::new(false),
-            |_| {},
+        panel.child(div().flex_1()).child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(MUTED))
+                .child("APFS 共享块、快照与压缩可能影响分配量。此数值不代表可释放空间。"),
         )
-        .unwrap();
-        let mut template = scan
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::File)
-            .unwrap()
-            .clone();
-        template.parent = Some(0);
-        template.children.clear();
-        scan.nodes.truncate(1);
-        scan.nodes[0].children = (1..=100_000).collect();
-        for id in 1..=100_000 {
-            let mut node = template.clone();
-            node.id = id;
-            scan.nodes.push(node);
+    }
+
+    fn status_bar(&self, cx: &mut Context<Self>) -> Div {
+        let status = if self.session.busy() {
+            format!(
+                "已检查 {} 个项目 · {}",
+                self.session.progress.as_ref().map_or(0, |p| p.entries),
+                if self.session.cancelling() {
+                    "正在取消"
+                } else {
+                    "后台扫描中"
+                }
+            )
+        } else {
+            self.session.status.clone()
+        };
+        let issue_count = self
+            .session
+            .result
+            .as_ref()
+            .map_or(0, |s| s.nodes[s.root].issue_count);
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .h(px(36.0))
+            .px_4()
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(0x0c131c))
+            .child(if self.session.busy() {
+                Spinner::new()
+                    .xsmall()
+                    .color(rgb(CYAN).into())
+                    .into_any_element()
+            } else {
+                div()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(rgb(if self.session.partial() { AMBER } else { CYAN }))
+                    .into_any_element()
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(rgb(if self.session.partial() { AMBER } else { MUTED }))
+                    .child(status),
+            )
+            .when(issue_count > 0, |el| {
+                el.child(
+                    Button::new("issues")
+                        .ghost()
+                        .xsmall()
+                        .label(format!("{issue_count} 处问题"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.show_dialog(true, window, cx)),
+                        ),
+                )
+            })
+            .child(
+                Button::new("about")
+                    .ghost()
+                    .xsmall()
+                    .label("统计说明")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.show_dialog(false, window, cx)),
+                    ),
+            )
+    }
+
+    fn show_dialog(&self, issues: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let records = if issues {
+            self.session
+                .result
+                .as_ref()
+                .map(|s| s.issues.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let count = self
+            .session
+            .result
+            .as_ref()
+            .map_or(0, |s| s.nodes[s.root].issue_count);
+        window.open_dialog(cx, move |dialog, _, _| {
+            let mut content = div().id("dialog-scroll").max_h(px(400.0)).overflow_y_scroll().flex().flex_col().gap_3().text_sm().text_color(rgb(MUTED));
+            if issues {
+                content = content.child("无法访问的内容没有纳入完整统计。应用不会提权或修改权限。")
+                    .child(format!("共 {count} 处问题，最多保存 500 条详情。"));
+                for issue in &records {
+                    content = content.child(div().p_3().rounded_lg().bg(rgb(0x192632))
+                        .child(div().text_color(rgb(AMBER)).child(issue.path.display().to_string()))
+                        .child(issue.message.clone()));
+                }
+            } else {
+                for line in [
+                    "Tree Lens 0.3 · 原生 Rust / GPUI Kit 0.9",
+                    "只读扫描文件系统元数据，不读取文件内容，不删除、移动或上传文件。",
+                    "磁盘占用来自已分配块数 × 512；逻辑大小为文件长度。硬链接分配空间在同次扫描中去重。",
+                    "不跟随符号链接，不跨入不同设备的挂载点。扫描取消或发生权限错误时，结果只是已扫描部分。",
+                    "APFS 克隆、快照、压缩与共享块无法精确归属，所以统计值不等于删除后能释放的空间。",
+                    "快捷键：⌘O 选择文件夹 · ⌘R 刷新 · ⌘F 筛选 · Esc 关闭说明或取消扫描。",
+                    "空间地图展示当前目录直接子项；虚拟文件树仅为当前视口构造行。",
+                ] { content = content.child(line); }
+            }
+            dialog.title(if issues { "读取问题" } else { "关于与统计说明" }).w(px(640.0)).centered().child(content)
+        });
+    }
+}
+
+impl Render for TreeLensApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let wide = window.viewport_size().width >= px(1340.0);
+        let detail_visible = window.viewport_size().width >= px(1220.0);
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .track_focus(&self.focus)
+            .key_context("TreeLens")
+            .on_action(
+                cx.listener(|this, _: &OpenFolder, window, cx| this.choose_folder(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &Refresh, window, cx| this.refresh(window, cx)))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                if !window.has_active_dialog(cx) {
+                    this.search_input
+                        .update(cx, |input, cx| input.focus(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CancelScan, window, cx| {
+                if window.has_active_dialog(cx) {
+                    window.close_dialog(cx);
+                } else {
+                    this.session.cancel();
+                }
+                cx.notify();
+            }))
+            .on_action(|_: &Quit, _, cx| cx.quit())
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                if let Some(path) = paths.0.first() {
+                    this.start(path.clone(), window, cx);
+                }
+            }))
+            .child(
+                TitleBar::new().bg(rgb(0x0c131c)).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .size_full()
+                        .child(div().text_color(rgb(CYAN)).child("◈"))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Tree Lens"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child("/ SPACE OBSERVATORY"),
+                        ),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .when(wide, |el| el.child(self.sidebar(cx)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .p_4()
+                            .gap_3()
+                            .child(self.toolbar(cx))
+                            .child(self.summaries())
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .gap_4()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .min_h_0()
+                                            .gap_4()
+                                            .when(self.session.result.is_some(), |el| {
+                                                el.child(self.footprint(cx))
+                                            })
+                                            .child(self.tree_panel(cx)),
+                                    )
+                                    .when(detail_visible, |el| el.child(self.inspector(cx))),
+                            ),
+                    ),
+            )
+            .child(self.status_bar(cx))
+    }
+}
+
+fn detail(label: &'static str, value: String) -> Div {
+    div()
+        .flex()
+        .justify_between()
+        .gap_2()
+        .text_xs()
+        .child(div().text_color(rgb(MUTED)).child(label))
+        .child(value)
+}
+
+fn sort_button(
+    label: &str,
+    sort: SortBy,
+    active: SortBy,
+    id: &'static str,
+    cx: &mut Context<TreeLensApp>,
+) -> Button {
+    Button::new(id)
+        .justify_start()
+        .px_0()
+        .ghost()
+        .xsmall()
+        .label(format!(
+            "{label}{}",
+            if sort == active {
+                if sort == SortBy::Name {
+                    " ↑"
+                } else {
+                    " ↓"
+                }
+            } else {
+                ""
+            }
+        ))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.session.sort_by(sort);
+            cx.notify();
+        }))
+}
+
+fn format_count(value: u64) -> String {
+    let text = value.to_string();
+    let mut result = String::with_capacity(text.len() + text.len() / 3);
+    for (index, ch) in text.chars().enumerate() {
+        if index > 0 && (text.len() - index).is_multiple_of(3) {
+            result.push(',');
         }
-        app.result = Some(scan);
-        app.expanded.insert(0);
-        app.rebuild_rows();
-        assert_eq!(app.rows.len(), 100_001);
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    Vec2::new(1180.0, 780.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.tree(ui));
-            },
-        );
-        assert!(!output.shapes.is_empty());
-        assert!(
-            output.shapes.len() < 4_000,
-            "only viewport rows should generate drawing shapes"
-        );
-        assert!(app.rows.estimated_heap_bytes() < 1024);
+        result.push(ch);
+    }
+    result
+}
+
+#[cfg(all(test, feature = "ui-tests"))]
+mod ui_tests {
+    use super::{install_theme, TreeLensApp};
+    use gpui_kit::component::WindowExt;
+    use gpui_kit::test::{TestQueryExt, TestWindowExt};
+    use gpui_kit::{
+        px, size, AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, WindowBounds,
+        WindowOptions,
+    };
+    use std::{
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
+    use tree_lens::{scanner::NodeKind, tree::SortBy};
+
+    fn fixture(
+        cx: &mut TestAppContext,
+        width: f32,
+        loaded: bool,
+    ) -> (AnyWindowHandle, Entity<TreeLensApp>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_theme(cx);
+        });
+        cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(width), px(760.0)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        let initial =
+                            loaded.then(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"));
+                        let mut app = TreeLensApp::new(initial, window, cx);
+                        if loaded {
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while app.session.busy() && Instant::now() < deadline {
+                                app.session.poll();
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            assert!(!app.session.busy());
+                            assert!(app.session.result.is_some());
+                            app.reset_projection();
+                        }
+                        app
+                    })
+                },
+            )
+        })
+        .expect("open test app")
+    }
+
+    #[gpui_kit::test]
+    fn empty_view_and_dialog_work_at_minimum_size(cx: &mut TestAppContext) {
+        let (handle, _) = fixture(cx, 1080.0, false);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let start = window.find("empty-open");
+            assert!(start.visible(), "start bounds: {:?}", start.bounds());
+            assert!(start.bounds().size.width > px(0.0));
+            assert!(start.bounds().bottom() < px(760.0));
+            window.click("about", cx);
+            assert!(window.has_active_dialog(cx));
+            window.press("escape", cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn loaded_view_sorts_and_keeps_input_state(cx: &mut TestAppContext) {
+        let (handle, view) = fixture(cx, 1440.0, true);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let rows = window.find_all_by_role(gpui_kit::Role::TreeItem);
+            assert!(!rows.is_empty());
+            assert!(rows[0].bounds().size.width > px(900.0));
+            window.click("sort-name", cx);
+            assert_eq!(view.read(cx).session.sort, SortBy::Name);
+            window.click("expand", cx);
+            window.click("collapse", cx);
+            assert!(!view.read(cx).session.rows.is_empty());
+            let field = window.find_by_label("按文件名筛选");
+            assert!(field.bounds().size.width > px(0.0));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn hundred_thousand_nodes_only_render_a_viewport(cx: &mut TestAppContext) {
+        let (handle, view) = fixture(cx, 1440.0, true);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                let scan = view.session.result.as_mut().unwrap();
+                let root = scan.root;
+                let mut template = scan
+                    .nodes
+                    .iter()
+                    .find(|node| node.kind == NodeKind::File)
+                    .unwrap()
+                    .clone();
+                template.children.clear();
+                template.parent = Some(root);
+                template.name = std::ffi::OsString::from("sample.bin").into_boxed_os_str();
+                scan.nodes[root].children.clear();
+                for _ in 0..100_000 {
+                    let id = scan.nodes.len();
+                    let mut node = template.clone();
+                    node.id = id;
+                    scan.nodes.push(node);
+                    scan.nodes[root].children.push(id);
+                }
+                view.session.collapse_all();
+                view.reset_projection();
+                cx.notify();
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let drawn = window.find_all_by_role(gpui_kit::Role::TreeItem).len();
+            assert!(drawn > 0 && drawn < 100, "rendered {drawn} rows");
+            assert_eq!(view.read(cx).session.rows.len(), 100_001);
+        })
+        .unwrap();
     }
 }

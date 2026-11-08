@@ -15,25 +15,29 @@ fn add(n: usize) {
 }
 unsafe impl GlobalAlloc for Meter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
+        // SAFETY: forward the caller-provided allocation contract to System.
+        let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
             add(layout.size());
         }
         p
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc_zeroed(layout);
+        // SAFETY: forward the caller-provided allocation contract to System.
+        let p = unsafe { System.alloc_zeroed(layout) };
         if !p.is_null() {
             add(layout.size());
         }
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        System.dealloc(p, layout);
+        // SAFETY: the caller guarantees p/layout came from this allocator.
+        unsafe { System.dealloc(p, layout) };
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
     }
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        let q = System.realloc(p, layout, size);
+        // SAFETY: forward the caller-provided pointer/layout/size contract.
+        let q = unsafe { System.realloc(p, layout, size) };
         if !q.is_null() {
             if size >= layout.size() {
                 add(size - layout.size());
@@ -100,5 +104,23 @@ fn main() {
         sort_time.as_secs_f64() * 1000.0,
         view.estimated_heap_bytes()
     );
-    println!("nodes={} files={} logical_bytes={} node_size={} scan_retained_bytes={} scan_peak_bytes={} scan_ms={:.3} expanded_set_bytes={} view_retained_bytes={} view_peak_bytes={} view_build_ms={:.3} row_count={} viewport_retained_bytes={} viewport_peak_bytes={} viewport_us={:.3} end_scroll_us={:.3}",scan.nodes.len(),scan.nodes[scan.root].file_count,scan.nodes[scan.root].total_logical_bytes,std::mem::size_of::<tree_lens::scanner::Node>(),scan_stats.0,scan_stats.1,scan_time.as_secs_f64()*1000.0,expansion_bytes,view_stats.0,view_stats.1,view_time.as_secs_f64()*1000.0,row_count,viewport_stats.0,viewport_stats.1,viewport_time.as_secs_f64()*1e6,end_time.as_secs_f64()*1e6);
+    println!(
+        "nodes={} files={} logical_bytes={} node_size={} scan_retained_bytes={} scan_peak_bytes={} scan_ms={:.3} expanded_set_bytes={} view_retained_bytes={} view_peak_bytes={} view_build_ms={:.3} row_count={} viewport_retained_bytes={} viewport_peak_bytes={} viewport_us={:.3} end_scroll_us={:.3}",
+        scan.nodes.len(),
+        scan.nodes[scan.root].file_count,
+        scan.nodes[scan.root].total_logical_bytes,
+        std::mem::size_of::<tree_lens::scanner::Node>(),
+        scan_stats.0,
+        scan_stats.1,
+        scan_time.as_secs_f64() * 1000.0,
+        expansion_bytes,
+        view_stats.0,
+        view_stats.1,
+        view_time.as_secs_f64() * 1000.0,
+        row_count,
+        viewport_stats.0,
+        viewport_stats.1,
+        viewport_time.as_secs_f64() * 1e6,
+        end_time.as_secs_f64() * 1e6
+    );
 }

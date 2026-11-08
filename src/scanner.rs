@@ -599,6 +599,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn non_utf8_names_reconstruct_exact_paths_in_memory() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // No filesystem fixture: APFS refuses invalid UTF-8 filenames, but
+        // path reconstruction must retain exact bytes on every Unix platform.
+        let names = [b"root-\xff".as_slice(), b"dir-\xfe", b"file-\xfd"];
+        let mut nodes: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| {
+                make_node(
+                    id,
+                    id.checked_sub(1),
+                    OsString::from_vec(name.to_vec()).into_boxed_os_str(),
+                    None,
+                    &mut HashSet::new(),
+                )
+            })
+            .collect();
+        nodes[0].children.push(1);
+        nodes[1].children.push(2);
+        let root_path = Path::new("/").join(nodes[0].name.as_ref());
+        let directory = root_path.join(nodes[1].name.as_ref());
+        let file = directory.join(nodes[2].name.as_ref());
+        let scan = ScanOutcome {
+            nodes,
+            root: 0,
+            root_path: root_path.clone(),
+            elapsed: Duration::ZERO,
+            cancelled: false,
+            issues: Vec::new(),
+        };
+        assert_eq!(scan.path_for(0), root_path);
+        assert_eq!(scan.path_for(1), directory);
+        assert_eq!(scan.path_for(2), file);
+        assert_eq!(scan.nodes[2].display_name(), "file-\u{fffd}");
+        assert_ne!(
+            scan.path_for(2),
+            PathBuf::from(file.to_string_lossy().as_ref())
+        );
+    }
+
+    // macOS APFS cannot create this fixture; the in-memory case above still runs.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
     fn non_utf8_names_retain_exact_filesystem_paths() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;

@@ -268,6 +268,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_utf8_node_without_using_existing_lossy_path() {
+        let fixture = Fixture::new();
+        let mut scan = fixture.scan();
+        let target = id(&scan, "child");
+        let name = OsString::from_vec(b"invalid-\xff".to_vec());
+        // APFS rejects invalid UTF-8 filenames. Keep this path in memory and
+        // create its valid, lossy lookalike to catch accidental substitution.
+        let lookalike = fixture
+            .0
+            .join("parent")
+            .join(name.to_string_lossy().as_ref());
+        fs::create_dir(&lookalike).unwrap();
+        scan.nodes[target].name = name.into_boxed_os_str();
+        assert!(DeletionRequest::prepare(&scan, target)
+            .and_then(|request| request.execute_with(|_| panic!("must not trash lossy path")))
+            .is_err());
+        assert!(lookalike.is_dir());
+    }
+
+    // macOS APFS cannot create this fixture; the in-memory case above still runs.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
     fn rejects_non_utf8_paths_without_lossy_action() {
         let fixture = Fixture::new();
         let name = OsString::from_vec(b"invalid-\xff".to_vec());
@@ -279,7 +301,9 @@ mod tests {
             .find(|node| node.name.as_ref() == name)
             .unwrap()
             .id;
-        assert!(DeletionRequest::prepare(&scan, target).is_err());
+        assert!(DeletionRequest::prepare(&scan, target)
+            .unwrap_err()
+            .contains("非 UTF-8"));
     }
 
     #[test]

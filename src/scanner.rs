@@ -3,7 +3,9 @@
 //! of a live filesystem, not an atomic snapshot. APFS clones/compression may share
 //! blocks that cannot be attributed exactly using portable filesystem metadata.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,8 +28,8 @@ pub struct Node {
     pub id: NodeId,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
-    pub path: PathBuf,
-    pub name: String,
+    /// Exact filename only. Full paths are reconstructed from parent links.
+    pub name: Box<OsStr>,
     pub kind: NodeKind,
     pub own_logical_bytes: u64,
     pub own_allocated_bytes: u64,
@@ -39,7 +41,7 @@ pub struct Node {
     pub directory_count: u64,
     /// All issues in the subtree, even when detailed issue storage is capped.
     pub issue_count: u64,
-    pub error: Option<String>,
+    pub error: Option<Box<str>>,
     pub hard_link_duplicate: bool,
 }
 
@@ -53,10 +55,47 @@ pub struct ScanIssue {
 pub struct ScanOutcome {
     pub nodes: Vec<Node>,
     pub root: NodeId,
+    pub root_path: PathBuf,
     pub elapsed: Duration,
     pub cancelled: bool,
     /// At most 500 details. The root issue_count retains the full count.
     pub issues: Vec<ScanIssue>,
+}
+
+impl Node {
+    /// Lossy conversion is for display only; filesystem operations retain exact bytes.
+    pub fn display_name(&self) -> Cow<'_, str> {
+        self.name.to_string_lossy()
+    }
+}
+
+impl ScanOutcome {
+    /// Reconstruct an exact path without storing a full path for every entry.
+    /// Panics if the ID does not belong to this outcome.
+    pub fn path_for(&self, id: NodeId) -> PathBuf {
+        reconstruct_path(&self.nodes, &self.root_path, id)
+    }
+}
+
+fn reconstruct_path(nodes: &[Node], root_path: &Path, mut id: NodeId) -> PathBuf {
+    let mut components = Vec::new();
+    while let Some(parent) = nodes[id].parent {
+        components.push(nodes[id].name.as_ref());
+        id = parent;
+    }
+    let mut path = root_path.to_path_buf();
+    for component in components.into_iter().rev() {
+        path.push(component);
+    }
+    path
+}
+
+/// Avoid allocator churn for tiny savings; no element cloning is involved.
+fn shrink_excess<T>(items: &mut Vec<T>) {
+    let spare = items.capacity().saturating_sub(items.len());
+    if spare >= items.len() / 4 && spare.saturating_mul(std::mem::size_of::<T>()) >= 4096 {
+        items.shrink_to_fit();
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,7 +145,7 @@ fn sizes(metadata: &Metadata, seen: &mut HashSet<(u64, u64)>) -> (u64, bool) {
 fn make_node(
     id: NodeId,
     parent: Option<NodeId>,
-    path: PathBuf,
+    name: Box<OsStr>,
     metadata: Option<&Metadata>,
     seen: &mut HashSet<(u64, u64)>,
 ) -> Node {
@@ -122,11 +161,7 @@ fn make_node(
         id,
         parent,
         children: Vec::new(),
-        name: path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string()),
-        path,
+        name,
         kind,
         own_logical_bytes: logical,
         own_allocated_bytes: allocated,
@@ -140,16 +175,22 @@ fn make_node(
     }
 }
 
-fn issue(node: &mut Node, issues: &mut Vec<ScanIssue>, state: &mut ScanProgress, message: String) {
+fn issue(
+    node: &mut Node,
+    path: &Path,
+    issues: &mut Vec<ScanIssue>,
+    state: &mut ScanProgress,
+    message: String,
+) {
     node.issue_count = node.issue_count.saturating_add(1);
     state.issues = state.issues.saturating_add(1);
     // Keep the first per-node message, rather than unbounded repeated messages.
     if node.error.is_none() {
-        node.error = Some(message.clone());
+        node.error = Some(message.clone().into_boxed_str());
     }
     if issues.len() < MAX_ISSUES {
         issues.push(ScanIssue {
-            path: node.path.clone(),
+            path: path.to_path_buf(),
             message,
         });
     }
@@ -163,7 +204,6 @@ fn count(node: &Node, state: &mut ScanProgress) {
     state.allocated_bytes = state
         .allocated_bytes
         .saturating_add(node.own_allocated_bytes);
-    state.current_path.clone_from(&node.path);
 }
 
 /// Scan one directory without recursion on the Rust call stack.
@@ -192,11 +232,15 @@ pub fn scan(
     }
     let root_device = device(&metadata);
     let mut seen = HashSet::new();
-    let mut nodes = vec![make_node(0, None, path, Some(&metadata), &mut seen)];
+    let root_name = path.file_name().unwrap_or(path.as_os_str()).into();
+    let mut nodes = vec![make_node(0, None, root_name, Some(&metadata), &mut seen)];
+    let root_path = path;
+    let mut latest_id = 0;
     let mut pending = vec![0];
     let mut issues = Vec::new();
     let mut state = ScanProgress::default();
     count(&nodes[0], &mut state);
+    state.current_path = root_path.clone();
     progress(state.clone());
     let mut last_progress = Instant::now();
     let mut cancelled = false;
@@ -205,12 +249,15 @@ pub fn scan(
             cancelled = true;
             break;
         }
+        let directory_path = reconstruct_path(&nodes, &root_path, id);
+        latest_id = id;
         // Recheck before opening: directories may have changed since discovery.
-        match fs::symlink_metadata(&nodes[id].path) {
+        match fs::symlink_metadata(&directory_path) {
             Ok(m) if m.is_dir() && device(&m) == root_device => {}
             Ok(_) => {
                 issue(
                     &mut nodes[id],
+                    &directory_path,
                     &mut issues,
                     &mut state,
                     "Directory changed type or device during scan; skipped".into(),
@@ -218,14 +265,26 @@ pub fn scan(
                 continue;
             }
             Err(e) => {
-                issue(&mut nodes[id], &mut issues, &mut state, e.to_string());
+                issue(
+                    &mut nodes[id],
+                    &directory_path,
+                    &mut issues,
+                    &mut state,
+                    e.to_string(),
+                );
                 continue;
             }
         }
-        let entries = match fs::read_dir(&nodes[id].path) {
+        let entries = match fs::read_dir(&directory_path) {
             Ok(entries) => entries,
             Err(e) => {
-                issue(&mut nodes[id], &mut issues, &mut state, e.to_string());
+                issue(
+                    &mut nodes[id],
+                    &directory_path,
+                    &mut issues,
+                    &mut state,
+                    e.to_string(),
+                );
                 continue;
             }
         };
@@ -235,7 +294,16 @@ pub fn scan(
                 break 'walk;
             }
             match entry {
-                Err(e) => issue(&mut nodes[id], &mut issues, &mut state, e.to_string()),
+                Err(e) => {
+                    latest_id = id;
+                    issue(
+                        &mut nodes[id],
+                        &directory_path,
+                        &mut issues,
+                        &mut state,
+                        e.to_string(),
+                    );
+                }
                 Ok(entry) => {
                     let child_path = entry.path();
                     let metadata = fs::symlink_metadata(&child_path);
@@ -243,16 +311,23 @@ pub fn scan(
                     let mut child = make_node(
                         child_id,
                         Some(id),
-                        child_path,
+                        entry.file_name().into_boxed_os_str(),
                         metadata.as_ref().ok(),
                         &mut seen,
                     );
                     match metadata {
-                        Err(e) => issue(&mut child, &mut issues, &mut state, e.to_string()),
+                        Err(e) => issue(
+                            &mut child,
+                            &child_path,
+                            &mut issues,
+                            &mut state,
+                            e.to_string(),
+                        ),
                         Ok(m) if child.kind == NodeKind::Directory => {
                             if device(&m) != root_device {
                                 issue(
                                     &mut child,
+                                    &child_path,
                                     &mut issues,
                                     &mut state,
                                     "Mount point skipped (different filesystem)".into(),
@@ -266,9 +341,11 @@ pub fn scan(
                     count(&child, &mut state);
                     nodes[id].children.push(child_id);
                     nodes.push(child);
+                    latest_id = child_id;
                 }
             }
             if last_progress.elapsed() >= Duration::from_millis(100) {
+                state.current_path = reconstruct_path(&nodes, &root_path, latest_id);
                 progress(state.clone());
                 last_progress = Instant::now();
             }
@@ -299,12 +376,19 @@ pub fn scan(
                 .then_with(|| nodes[*a].name.cmp(&nodes[*b].name))
                 .then_with(|| a.cmp(b))
         });
+        shrink_excess(&mut children);
         nodes[id].children = children;
     }
+    // Free traversal-only storage before potentially resizing the arena.
+    drop(pending);
+    drop(seen);
+    shrink_excess(&mut nodes);
+    state.current_path = reconstruct_path(&nodes, &root_path, latest_id);
     progress(state);
     Ok(ScanOutcome {
         nodes,
         root: 0,
+        root_path,
         elapsed: start.elapsed(),
         cancelled,
         issues,
@@ -468,14 +552,86 @@ mod tests {
 
     #[test]
     fn issue_details_are_bounded_but_count_is_not() {
-        let mut n = make_node(0, None, PathBuf::from("missing"), None, &mut HashSet::new());
+        let mut n = make_node(
+            0,
+            None,
+            OsStr::new("missing").into(),
+            None,
+            &mut HashSet::new(),
+        );
         let mut issues = Vec::new();
         let mut p = ScanProgress::default();
         for _ in 0..600 {
-            issue(&mut n, &mut issues, &mut p, "error".into());
+            issue(
+                &mut n,
+                Path::new("missing"),
+                &mut issues,
+                &mut p,
+                "error".into(),
+            );
         }
         assert_eq!(issues.len(), 500);
         assert_eq!(n.issue_count, 600);
         assert_eq!(p.issues, 600);
+    }
+
+    #[test]
+    fn deep_paths_are_reconstructed_iteratively() {
+        let t = Temp::new();
+        let mut path = t.0.clone();
+        for _ in 0..128 {
+            path.push("d");
+            fs::create_dir(&path).unwrap();
+        }
+        path.push("leaf");
+        fs::write(&path, b"ok").unwrap();
+        let s = t.scan();
+        let leaf = s.nodes.iter().find(|n| n.kind == NodeKind::File).unwrap();
+        assert_eq!(s.path_for(leaf.id), path);
+        assert_eq!(s.path_for(s.root), t.0);
+        assert_eq!(leaf.display_name(), "leaf");
+        assert_eq!(s.nodes[s.root].directory_count, 129);
+        assert_eq!(s.nodes[s.root].total_logical_bytes, 2);
+        assert!(s.nodes[1..]
+            .iter()
+            .all(|n| !n.name.as_encoded_bytes().contains(&b'/')));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_retain_exact_filesystem_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let t = Temp::new();
+        let directory = t.0.join(OsString::from_vec(vec![b'd', 0xff]));
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join(OsString::from_vec(vec![b'f', 0xfe]));
+        fs::write(&file, b"exact").unwrap();
+        let s = scan(&directory, &AtomicBool::new(false), |_| {}).unwrap();
+        let leaf = s.nodes.iter().find(|n| n.kind == NodeKind::File).unwrap();
+        assert_eq!(s.path_for(s.root), directory);
+        assert_eq!(s.path_for(leaf.id), file);
+        assert_eq!(fs::read(s.path_for(leaf.id)).unwrap(), b"exact");
+        assert!(leaf.display_name().contains('\u{fffd}'));
+        // Also traverse the invalid-UTF8 directory as a non-root node.
+        let s = t.scan();
+        let leaf = s.nodes.iter().find(|n| n.kind == NodeKind::File).unwrap();
+        assert_eq!(s.path_for(leaf.id), file);
+    }
+
+    #[test]
+    fn final_progress_has_latest_exact_path() {
+        let t = Temp::new();
+        let path = t.0.join("only-file");
+        fs::write(&path, b"content").unwrap();
+        let mut updates = Vec::new();
+        let s = scan(&t.0, &AtomicBool::new(false), |p| updates.push(p)).unwrap();
+        assert_eq!(updates.first().unwrap().current_path, t.0);
+        assert_eq!(updates.last().unwrap().current_path, path);
+        assert_eq!(updates.last().unwrap().entries, s.nodes.len() as u64);
+        assert_eq!(
+            updates.last().unwrap().logical_bytes,
+            s.nodes[s.root].total_logical_bytes
+        );
     }
 }

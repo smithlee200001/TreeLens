@@ -11,7 +11,7 @@ fn main() {
         Ok(scan) => {
             let root = &scan.nodes[scan.root];
             println!("{}\nAllocated: {}\nLogical: {}\nFiles: {}\nSubfolders: {}\nIssues: {}\nElapsed: {:.3}s",
-                root.path.display(), format_bytes(root.total_allocated_bytes),
+                scan.root_path.display(), format_bytes(root.total_allocated_bytes),
                 format_bytes(root.total_logical_bytes), root.file_count,
                 root.directory_count.saturating_sub(1), root.issue_count, scan.elapsed.as_secs_f64());
             for id in root.children.iter().take(20) {
@@ -20,7 +20,7 @@ fn main() {
                     "{:>12}  {:>12}  {}",
                     format_bytes(node.total_allocated_bytes),
                     format_bytes(node.total_logical_bytes),
-                    node.name
+                    node.display_name()
                 );
             }
             if root.issue_count > 0 {

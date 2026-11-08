@@ -1,0 +1,4 @@
+sort_ms=0.000 view_estimated_heap_bytes=192
+nodes=2 files=1 logical_bytes=0 node_size=144 scan_retained_bytes=664 scan_peak_bytes=860 scan_ms=0.028 expanded_set_bytes=52 view_retained_bytes=276 view_peak_bytes=316 view_build_ms=0.003 row_count=2 viewport_retained_bytes=64 viewport_peak_bytes=64 viewport_us=0.461 end_scroll_us=0.070
+sort_ms=0.000 view_estimated_heap_bytes=192
+nodes=2 files=1 logical_bytes=1099511627776 node_size=144 scan_retained_bytes=664 scan_peak_bytes=860 scan_ms=0.022 expanded_set_bytes=52 view_retained_bytes=276 view_peak_bytes=316 view_build_ms=0.002 row_count=2 viewport_retained_bytes=64 viewport_peak_bytes=64 viewport_us=0.210 end_scroll_us=0.071

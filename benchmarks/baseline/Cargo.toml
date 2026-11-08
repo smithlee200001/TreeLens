@@ -1,0 +1,12 @@
+# Frozen original core, std only, for reproducible before/after comparison.
+[package]
+name = "tree-lens"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+[features]
+default = []
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

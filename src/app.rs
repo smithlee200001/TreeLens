@@ -2,11 +2,11 @@ use eframe::egui::{self, Color32, FontFamily, RichText, Vec2};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tree_lens::format_bytes;
 use tree_lens::scanner::{self, NodeId, NodeKind, ScanOutcome, ScanProgress};
-use tree_lens::tree::{visible_rows, SortBy};
+use tree_lens::tree::{sort_tree, SortBy, VisibleTree};
 
 const ACCENT: Color32 = Color32::from_rgb(97, 201, 174);
 const MUTED: Color32 = Color32::from_rgb(149, 160, 177);
@@ -14,7 +14,6 @@ const WARN: Color32 = Color32::from_rgb(242, 187, 98);
 const ROW_HEIGHT: f32 = 31.0;
 
 enum WorkerEvent {
-    Progress(ScanProgress),
     Finished(Result<ScanOutcome, String>),
 }
 
@@ -29,7 +28,10 @@ pub struct TreeLensApp {
     progress: Option<ScanProgress>,
     status: String,
     expanded: HashSet<NodeId>,
-    rows: Vec<(NodeId, usize)>,
+    rows: VisibleTree,
+    latest_progress: Option<Arc<Mutex<Option<ScanProgress>>>>,
+    query_changed: Option<Instant>,
+    applied_query: String,
     query: String,
     sort: SortBy,
     selected: Option<NodeId>,
@@ -68,7 +70,10 @@ impl TreeLensApp {
             progress: None,
             status: "选择一个文件夹，了解空间都用在了哪里。".into(),
             expanded: HashSet::new(),
-            rows: Vec::new(),
+            rows: VisibleTree::new(),
+            latest_progress: None,
+            query_changed: None,
+            applied_query: String::new(),
             query: String::new(),
             sort: SortBy::default(),
             selected: None,
@@ -107,8 +112,10 @@ impl TreeLensApp {
         self.path_text = path.display().to_string();
         self.root_path = Some(path.clone());
         self.result = None;
-        self.rows.clear();
-        self.expanded.clear();
+        self.rows = VisibleTree::new();
+        self.query_changed = None;
+        self.applied_query.clear();
+        self.expanded = HashSet::new();
         self.selected = None;
         self.query.clear();
         self.progress = None;
@@ -116,13 +123,17 @@ impl TreeLensApp {
         self.status = "正在扫描…".into();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let latest_progress = Arc::new(Mutex::new(None));
+        let worker_progress = Arc::clone(&latest_progress);
         let context = ctx.clone();
         let spawn = std::thread::Builder::new()
             .name("disk-scanner".into())
             .spawn(move || {
                 let result = scanner::scan(&path, &worker_cancel, |progress| {
-                    let _ = sender.send(WorkerEvent::Progress(progress));
+                    if let Ok(mut latest) = worker_progress.lock() {
+                        *latest = Some(progress);
+                    }
                     context.request_repaint();
                 })
                 .map_err(|error| error.to_string());
@@ -131,6 +142,7 @@ impl TreeLensApp {
             });
         match spawn {
             Ok(_) => {
+                self.latest_progress = Some(latest_progress);
                 self.cancel = Some(cancel);
                 self.receiver = Some(receiver);
             }
@@ -141,56 +153,66 @@ impl TreeLensApp {
     }
 
     fn poll(&mut self) {
+        if let Some(latest) = &self.latest_progress {
+            if let Ok(mut progress) = latest.lock() {
+                if let Some(progress) = progress.take() {
+                    self.progress = Some(progress);
+                }
+            }
+        }
         let mut completed = false;
         if let Some(receiver) = &self.receiver {
-            loop {
-                match receiver.try_recv() {
-                    Ok(WorkerEvent::Progress(progress)) => self.progress = Some(progress),
-                    Ok(WorkerEvent::Finished(result)) => {
-                        match result {
-                            Ok(scan) => {
-                                let root = &scan.nodes[scan.root];
-                                self.status = if scan.cancelled {
-                                    "扫描已取消，下方仅显示已扫描部分，不代表完整大小。".into()
-                                } else if root.issue_count > 0 {
-                                    format!(
-                                        "扫描结束 · {} 处未能完整读取，统计可能偏小",
-                                        root.issue_count
-                                    )
-                                } else {
-                                    format!("扫描完成 · {:.1} 秒", scan.elapsed.as_secs_f64())
-                                };
-                                self.expanded.insert(scan.root);
-                                self.selected = Some(scan.root);
-                                self.result = Some(scan);
-                            }
-                            Err(error) => self.status = format!("扫描失败：{error}"),
+            match receiver.try_recv() {
+                Ok(WorkerEvent::Finished(result)) => {
+                    match result {
+                        Ok(scan) => {
+                            let root = &scan.nodes[scan.root];
+                            self.status = if scan.cancelled {
+                                "扫描已取消，下方仅显示已扫描部分，不代表完整大小。".into()
+                            } else if root.issue_count > 0 {
+                                format!(
+                                    "扫描结束 · {} 处未能完整读取，统计可能偏小",
+                                    root.issue_count
+                                )
+                            } else {
+                                format!("扫描完成 · {:.1} 秒", scan.elapsed.as_secs_f64())
+                            };
+                            self.expanded.insert(scan.root);
+                            self.selected = Some(scan.root);
+                            self.result = Some(scan);
                         }
-                        completed = true;
-                        break;
+                        Err(error) => self.status = format!("扫描失败：{error}"),
                     }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.status = "扫描线程意外结束，请重新扫描。".into();
-                        completed = true;
-                        break;
-                    }
+                    completed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.status = "扫描线程意外结束，请重新扫描。".into();
+                    completed = true;
                 }
             }
         }
         if completed {
             self.receiver = None;
             self.cancel = None;
+            self.latest_progress = None;
+            if let Some(scan) = &mut self.result {
+                if self.sort != SortBy::Allocated {
+                    sort_tree(scan, self.sort);
+                }
+            }
             self.rebuild_rows();
         }
     }
 
     fn rebuild_rows(&mut self) {
-        self.rows = self
-            .result
-            .as_ref()
-            .map(|scan| visible_rows(scan, &self.expanded, &self.query, self.sort))
-            .unwrap_or_default();
+        self.query_changed = None;
+        self.applied_query.clone_from(&self.query);
+        if let Some(scan) = &self.result {
+            self.rows.rebuild(scan, &self.expanded, &self.query);
+        } else {
+            self.rows = VisibleTree::new();
+        }
     }
 
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -323,22 +345,29 @@ impl TreeLensApp {
                 )
                 .changed();
             if changed {
-                self.rebuild_rows();
+                self.query_changed = Some(Instant::now());
             }
             if !self.query.is_empty() && ui.small_button("清除").clicked() {
                 self.query.clear();
                 self.rebuild_rows();
             }
-            if ui.button("收起全部").clicked() {
-                self.expanded.clear();
+            if ui
+                .add_enabled(self.query.trim().is_empty(), egui::Button::new("收起全部"))
+                .clicked()
+            {
+                self.expanded = HashSet::new();
                 if let Some(scan) = &self.result {
                     self.expanded.insert(scan.root);
                 }
                 self.rebuild_rows();
             }
-            if ui.button("展开一级").clicked() {
-                let ids: Vec<_> = self.rows.iter().map(|(id, _)| *id).collect();
-                self.expanded.extend(ids);
+            if ui
+                .add_enabled(self.query.trim().is_empty(), egui::Button::new("展开一级"))
+                .clicked()
+            {
+                if let Some(scan) = &self.result {
+                    self.rows.expand_one_level(scan, &mut self.expanded);
+                }
                 self.rebuild_rows();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -419,12 +448,15 @@ impl TreeLensApp {
                     .id_salt("vertical-tree")
                     .auto_shrink([false, false])
                     .show_rows(ui, ROW_HEIGHT, self.rows.len(), |ui, range| {
-                        for index in range {
-                            let (id, depth) = self.rows[index];
+                        let first = range.start;
+                        for (offset, (id, depth)) in
+                            self.rows.rows(scan, range).into_iter().enumerate()
+                        {
+                            let index = first + offset;
                             let node = &scan.nodes[id];
                             let is_dir = node.kind == NodeKind::Directory;
-                            let is_open =
-                                self.expanded.contains(&id) || !self.query.trim().is_empty();
+                            let is_open = self.expanded.contains(&id)
+                                || !self.applied_query.trim().is_empty();
                             let fill = if self.selected == Some(id) {
                                 Color32::from_rgb(36, 63, 65)
                             } else if index % 2 == 0 {
@@ -460,7 +492,7 @@ impl TreeLensApp {
                                                 .frame(false),
                                             )
                                             .clicked()
-                                            && self.query.trim().is_empty()
+                                            && self.applied_query.trim().is_empty()
                                         {
                                             toggle = Some(id);
                                         }
@@ -480,7 +512,7 @@ impl TreeLensApp {
                                     }));
                                     let label = format!(
                                         "{}{}{}",
-                                        node.name,
+                                        node.display_name(),
                                         if node.hard_link_duplicate {
                                             "  [硬链接]"
                                         } else {
@@ -504,26 +536,25 @@ impl TreeLensApp {
                                     }
                                     if response.double_clicked()
                                         && is_dir
-                                        && self.query.trim().is_empty()
+                                        && self.applied_query.trim().is_empty()
                                     {
                                         toggle = Some(id);
                                     }
-                                    response.clone().on_hover_text(format!(
-                                        "{}{}",
-                                        node.path.display(),
-                                        node.error
-                                            .as_ref()
-                                            .map(|e| format!("\n{e}"))
-                                            .unwrap_or_default()
-                                    ));
+                                    response.clone().on_hover_ui(|ui| {
+                                        ui.label(scan.path_for(id).display().to_string());
+                                        if let Some(error) = &node.error {
+                                            ui.label(error.as_ref());
+                                        }
+                                    });
                                     response.context_menu(|ui| {
                                         if ui.button("复制完整路径").clicked() {
-                                            ui.ctx().copy_text(node.path.display().to_string());
+                                            ui.ctx()
+                                                .copy_text(scan.path_for(id).display().to_string());
                                             ui.close_menu();
                                         }
                                         #[cfg(target_os = "macos")]
                                         if ui.button("在 Finder 中显示").clicked() {
-                                            reveal = Some(node.path.clone());
+                                            reveal = Some(scan.path_for(id));
                                             ui.close_menu();
                                         }
                                     });
@@ -578,8 +609,13 @@ impl TreeLensApp {
             self.rebuild_rows();
         }
         if let Some(sort) = next_sort {
-            self.sort = sort;
-            self.rebuild_rows();
+            if self.sort != sort {
+                self.sort = sort;
+                if let Some(scan) = &mut self.result {
+                    sort_tree(scan, sort);
+                }
+                self.rebuild_rows();
+            }
         }
         if let Some(id) = selection {
             self.selected = Some(id);
@@ -613,7 +649,7 @@ impl TreeLensApp {
                 }
             });
         egui::Window::new("关于 Tree Lens").open(&mut self.show_about).default_width(530.0).show(ctx, |ui| {
-            ui.heading("Tree Lens 0.1");
+            ui.heading("Tree Lens 0.2");
             ui.label("一个用 Rust 编写的只读磁盘空间分析工具，当前面向 macOS。");
             ui.separator();
             for text in [
@@ -633,6 +669,12 @@ impl TreeLensApp {
 impl eframe::App for TreeLensApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        if self
+            .query_changed
+            .is_some_and(|changed| changed.elapsed() >= Duration::from_millis(180))
+        {
+            self.rebuild_rows();
+        }
         if let Some(path) = self.initial_path.take() {
             self.start(path, ctx);
         }
@@ -688,11 +730,11 @@ impl eframe::App for TreeLensApp {
                     }
                 });
                 let path = if self.busy() {
-                    self.progress.as_ref().map(|p| &p.current_path)
+                    self.progress.as_ref().map(|p| p.current_path.clone())
                 } else {
                     self.result
                         .as_ref()
-                        .and_then(|s| self.selected.map(|id| &s.nodes[id].path))
+                        .and_then(|s| self.selected.map(|id| s.path_for(id)))
                 };
                 if let Some(path) = path {
                     ui.add(
@@ -718,7 +760,7 @@ impl eframe::App for TreeLensApp {
                 self.tree(ui);
             });
         self.dialogs(ctx);
-        if self.busy() {
+        if self.busy() || self.query_changed.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -884,5 +926,73 @@ mod tests {
             );
         }
         assert!(fs::metadata(env!("CARGO_MANIFEST_DIR")).unwrap().is_dir());
+    }
+
+    #[test]
+    fn progress_is_coalesced_in_one_slot() {
+        let ctx = egui::Context::default();
+        let mut app = TreeLensApp::with_context(&ctx, None);
+        let latest = Arc::new(Mutex::new(None));
+        app.latest_progress = Some(Arc::clone(&latest));
+        for entries in 0..10_000 {
+            *latest.lock().unwrap() = Some(ScanProgress {
+                entries,
+                ..Default::default()
+            });
+        }
+        app.poll();
+        assert_eq!(app.progress.as_ref().unwrap().entries, 9_999);
+        assert!(latest.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn gui_virtualizes_a_hundred_thousand_items() {
+        let ctx = egui::Context::default();
+        let mut app = TreeLensApp::with_context(&ctx, None);
+        let mut scan = scanner::scan(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .as_path(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let mut template = scan
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::File)
+            .unwrap()
+            .clone();
+        template.parent = Some(0);
+        template.children.clear();
+        scan.nodes.truncate(1);
+        scan.nodes[0].children = (1..=100_000).collect();
+        for id in 1..=100_000 {
+            let mut node = template.clone();
+            node.id = id;
+            scan.nodes.push(node);
+        }
+        app.result = Some(scan);
+        app.expanded.insert(0);
+        app.rebuild_rows();
+        assert_eq!(app.rows.len(), 100_001);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1180.0, 780.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tree(ui));
+            },
+        );
+        assert!(!output.shapes.is_empty());
+        assert!(
+            output.shapes.len() < 4_000,
+            "only viewport rows should generate drawing shapes"
+        );
+        assert!(app.rows.estimated_heap_bytes() < 1024);
     }
 }

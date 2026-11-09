@@ -15,9 +15,13 @@
 - `bash -n scripts/bundle-macos.sh`：Mac 打包脚本语法检查通过。Windows workflow YAML 已解析核查。
 - `src/tree.rs`、`src/footprint.rs` 与基线一致；Unix 硬链接 key 仍为 16 字节，Windows 完整文件 ID key 为 32 字节，有测试防止改变 Unix 内存开销。100,000 节点虚拟列表测试继续通过。
 
-## Windows 专用测试覆盖（已编译，尚未运行）
+## Windows 原生核心测试
 
-- 实际 NTFS 夹具：普通文件分配量、硬链接、稀疏文件、压缩文件、中文/emoji 路径、文件占用时仍可见且报问题。
+GitHub Windows Server 2022 x64/MSVC 已在提交 `25197f8bd508a99f5adf619aa1575d4f952c4006` 运行并通过全部 53 项核心测试，包括下列 Windows 专用夹具。证据：[Windows CI](https://github.com/smithlee200001/TreeLens/actions/runs/42612087760)。该轮 GUI 已完成编译/链接；一个界面测试因窗口关闭按钮与弹窗关闭按钮的 ID 重名失败，现已将选择器限定到弹窗内。最终 GUI/release/打包结果以 [PR #1 最新检查](https://github.com/smithlee200001/TreeLens/pull/1) 为准。
+
+## Windows 专用测试覆盖（原生核心已通过）
+
+- 实际 NTFS 夹具：普通文件分配量、硬链接、稀疏文件、压缩文件、中文/emoji 路径、文件独占数据锁不影响元数据读取；注入属性查询拒绝时项目仍可见且报问题。
 - 联接点不跟随、根目录/上级含联接点拒绝、扫描过程中换成联接点拒绝，以及有歧义的驱动器相对路径拒绝。
 - 系统已知文件夹路径、`~\\` 展开和 UNC/盘符路径保留。
 - 文件夹回收请求：根/普通文件/无效节点/路径逃逸拒绝，确认后目标、上级、根替换和目标消失拒绝，Unicode 路径保真及无法准确显示的非 Unicode 名称拒绝。
@@ -27,7 +31,7 @@
 
 ## 未执行，不代表通过
 
-- Windows 原生 GUI 完整编译/链接、release HLSL 编译、PowerShell ZIP 打包脚本执行及 ZIP 运行。
+- Windows release HLSL 编译、PowerShell ZIP 打包脚本及 ZIP 运行不在上述本地检查范围内；远端构建状态以 PR 的最新 CI 为准。
 - Windows 实际窗口、Direct3D 渲染、系统目录选择器、资源管理器显示、文件夹拖放、100%/150%/200% DPI、非英文或重定向系统文件夹端到端检查。
 - **Windows 实际回收站成功/恢复、被禁用/容量不足/超大项目/权限或锁定失败路径。** 必须在可丢弃测试环境验证，详见 [WINDOWS.md](docs/WINDOWS.md)。回调单元测试不能替代 Shell 失败路径实测。
 - 本版本 macOS 原生 GUI/Metal、Finder/废纸篓实机验收、Intel Mac、签名/公证。

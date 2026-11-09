@@ -2,7 +2,7 @@
 
 Rust 编写的原生磁盘空间分析工具。0.4 新增 Windows x64 支持：分配空间统计、硬链接去重、资源管理器显示、系统文件夹快捷入口和需要确认的回收站操作。macOS 的扫描及废纸篓功能保留。0.3 将 **eframe / egui 完全替换为 GPUI Kit 0.9.0**，使用原生 GPU 窗口与控件，不是网页套壳，也没有保留另一套旧 UI。
 
-> **验证状态：Windows 核心代码与测试已通过 MSVC 跨目标类型检查，Linux 回归测试已通过；Windows 原生构建、实际窗口与回收站验收尚未执行。** 当前提供源码及 Windows CI/打包脚本，不是已验证或签名的 Windows 安装包。详见 [TESTING.md](TESTING.md) 和 [Windows 构建说明](docs/WINDOWS.md)。
+> **验证状态：Windows 原生 MSVC 核心测试（53 项）和 Linux GUI 回归测试已通过；Windows 完整 release/打包状态见 [PR #1 的最新 CI](https://github.com/smithlee200001/TreeLens/pull/1)。实际 Windows 桌面与回收站验收尚未执行。** 当前提供源码及 Windows CI/打包脚本，不包含签名的 Windows 安装包。详见 [TESTING.md](TESTING.md) 和 [Windows 构建说明](docs/WINDOWS.md)。
 
 ## 新界面
 

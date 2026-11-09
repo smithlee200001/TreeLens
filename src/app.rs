@@ -1908,7 +1908,9 @@ mod ui_tests {
             assert!(view.read(cx).deletion.is_none());
             assert!(view.read(cx).pending_deletion.is_none());
             view.update(cx, |app, cx| app.request_delete(id, window, cx));
-            window.click("close", cx);
+            // Windows also has a title-bar Close button with this local ID.
+            window.render_frame(cx);
+            window.within("dialog-close").click("close", cx);
             assert!(!window.has_active_dialog(cx));
             assert!(view.read(cx).pending_deletion.is_none());
             view.update(cx, |app, cx| app.request_delete(id, window, cx));

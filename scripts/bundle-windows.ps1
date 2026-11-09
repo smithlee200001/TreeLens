@@ -37,7 +37,13 @@ try {
     Copy-Item -LiteralPath $exe -Destination (Join-Path $bundle 'tree-lens.exe')
     Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $bundle 'LICENSE.txt')
     Copy-Item -LiteralPath 'README.md' -Destination $bundle
-    Copy-Item -LiteralPath 'docs/WINDOWS.md' -Destination $bundle
+    Copy-Item -LiteralPath 'docs' -Destination $bundle -Recurse
+    Get-ChildItem -Path 'TESTING*.md' -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $bundle
+    }
+    $benchmarkDocs = Join-Path $bundle 'benchmarks'
+    New-Item -ItemType Directory -Path $benchmarkDocs -Force | Out-Null
+    Copy-Item -LiteralPath 'benchmarks/README.md' -Destination $benchmarkDocs
 
     $notices = [System.Collections.Generic.List[string]]::new()
     $notices.Add('# Dependency license inventory')

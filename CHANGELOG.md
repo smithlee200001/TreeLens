@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.4.0 · Windows support (2026-11-09)
+
+- Add Windows x64 MSVC target, native folder picker, Explorer reveal, Known Folder shortcuts and Ctrl keyboard shortcuts.
+- Account for Windows allocation, sparse/compressed files and hardlinks using metadata-only handles; skip reparse points and junctions.
+- Add explicit-confirmation Windows Recycle Bin backend with identity checks, per-item result validation and permanent-delete veto. Restrict deletion to fixed local drives.
+- Preserve macOS behavior, compact nodes, virtual list rendering and filtering/cancellation semantics.
+- Add Windows tests, CI and portable development ZIP packaging. Native Windows build/runtime validation is pending; see TESTING.md.
+
 ## 0.3.1 · 文件夹删除菜单
 
 - 在文件树的文件夹右键菜单加入「删除文件夹…（移到废纸篓）」，宽窗口详情栏也有入口。

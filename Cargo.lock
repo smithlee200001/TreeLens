@@ -7265,10 +7265,12 @@ dependencies = [
 
 [[package]]
 name = "tree-lens"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "gpui-kit",
  "objc2-foundation 0.3.2",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

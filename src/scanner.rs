@@ -15,6 +15,12 @@ use std::time::{Duration, Instant};
 pub type NodeId = usize;
 const MAX_ISSUES: usize = 500;
 
+// Retain Unix's compact (device, inode) key; Windows needs a full 128-bit ID.
+#[cfg(windows)]
+type FileKey = (u64, u128);
+#[cfg(not(windows))]
+type FileKey = (u64, u64);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     Directory,
@@ -114,12 +120,12 @@ fn device(metadata: &Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.dev()
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn device(_: &Metadata) -> u64 {
     0
 }
 
-fn sizes(metadata: &Metadata, seen: &mut HashSet<(u64, u64)>) -> (u64, bool) {
+fn sizes(metadata: &Metadata, seen: &mut HashSet<FileKey>) -> (u64, bool) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -135,7 +141,12 @@ fn sizes(metadata: &Metadata, seen: &mut HashSet<(u64, u64)>) -> (u64, bool) {
             duplicate,
         )
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = (metadata, seen);
+        (0, false) // Filled from no-follow handle metadata, never logical length.
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = seen;
         (if metadata.is_dir() { 0 } else { metadata.len() }, false)
@@ -147,12 +158,12 @@ fn make_node(
     parent: Option<NodeId>,
     name: Box<OsStr>,
     metadata: Option<&Metadata>,
-    seen: &mut HashSet<(u64, u64)>,
+    seen: &mut HashSet<FileKey>,
 ) -> Node {
     let kind = match metadata {
+        Some(m) if m.file_type().is_symlink() => NodeKind::Symlink,
         Some(m) if m.is_dir() => NodeKind::Directory,
         Some(m) if m.is_file() => NodeKind::File,
-        Some(m) if m.file_type().is_symlink() => NodeKind::Symlink,
         _ => NodeKind::Other,
     };
     let logical = metadata.map_or(0, |m| if m.is_dir() { 0 } else { m.len() });
@@ -214,9 +225,40 @@ fn count(node: &Node, state: &mut ScanProgress) {
 pub fn scan(
     path: &Path,
     cancel: &AtomicBool,
+    progress: impl FnMut(ScanProgress),
+) -> io::Result<ScanOutcome> {
+    scan_impl(
+        path,
+        cancel,
+        progress,
+        #[cfg(windows)]
+        crate::windows_fs::query,
+    )
+}
+
+// The Windows query seam allows deterministic filesystem-failure tests without
+// requesting file-data access or changing ACLs on the test runner.
+fn scan_impl(
+    path: &Path,
+    cancel: &AtomicBool,
     mut progress: impl FnMut(ScanProgress),
+    #[cfg(windows)] mut query: impl FnMut(&Path) -> io::Result<crate::windows_fs::EntryInfo>,
 ) -> io::Result<ScanOutcome> {
     let start = Instant::now();
+    #[cfg(windows)]
+    if !path.has_root()
+        && matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        )
+    {
+        // `C:folder` uses Windows' per-drive working directory, not necessarily
+        // this process's current directory. Never silently reinterpret it.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Drive-relative paths are ambiguous; choose an absolute path such as C:\\folder",
+        ));
+    }
     // Make relative input independent of the caller's later working-directory changes.
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -230,6 +272,25 @@ pub fn scan(
             "Choose a directory, not a file or symbolic link",
         ));
     }
+    #[cfg(windows)]
+    let root_device = {
+        if crate::windows_fs::is_reparse(&metadata) {
+            return Err(io::Error::other("Reparse-point roots are not scanned"));
+        }
+        // Reject a root reached through a junction as well as a junction root.
+        // Prefix-only ancestors (for example `C:`) are not filesystem entries.
+        for ancestor in path.ancestors().skip(1).filter(|p| p.has_root()) {
+            if crate::windows_fs::is_reparse(&fs::symlink_metadata(ancestor)?) {
+                return Err(io::Error::other("Root has a reparse-point ancestor"));
+            }
+        }
+        let info = query(&path)?;
+        if info.reparse || !info.directory {
+            return Err(io::Error::other("Root changed type or is a reparse point"));
+        }
+        info.volume
+    };
+    #[cfg(not(windows))]
     let root_device = device(&metadata);
     let mut seen = HashSet::new();
     let root_name = path.file_name().unwrap_or(path.as_os_str()).into();
@@ -252,6 +313,28 @@ pub fn scan(
         let directory_path = reconstruct_path(&nodes, &root_path, id);
         latest_id = id;
         // Recheck before opening: directories may have changed since discovery.
+        #[cfg(windows)]
+        let checked = query(&directory_path).and_then(|info| {
+            if !info.directory || info.reparse || info.volume != root_device {
+                Err(io::Error::other(
+                    "Directory changed type, became a reparse point, or changed volume; skipped",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        #[cfg(windows)]
+        if let Err(e) = checked {
+            issue(
+                &mut nodes[id],
+                &directory_path,
+                &mut issues,
+                &mut state,
+                e.to_string(),
+            );
+            continue;
+        }
+        #[cfg(not(windows))]
         match fs::symlink_metadata(&directory_path) {
             Ok(m) if m.is_dir() && device(&m) == root_device => {}
             Ok(_) => {
@@ -306,6 +389,11 @@ pub fn scan(
                 }
                 Ok(entry) => {
                     let child_path = entry.path();
+                    // Windows directory enumeration already carries size/type
+                    // metadata, even when opening the entry is denied.
+                    #[cfg(windows)]
+                    let metadata = entry.metadata();
+                    #[cfg(not(windows))]
                     let metadata = fs::symlink_metadata(&child_path);
                     let child_id = nodes.len();
                     let mut child = make_node(
@@ -315,6 +403,60 @@ pub fn scan(
                         metadata.as_ref().ok(),
                         &mut seen,
                     );
+                    #[cfg(windows)]
+                    match metadata {
+                        Err(e) => issue(
+                            &mut child,
+                            &child_path,
+                            &mut issues,
+                            &mut state,
+                            e.to_string(),
+                        ),
+                        Ok(m) if crate::windows_fs::is_reparse(&m) => {
+                            issue(&mut child, &child_path, &mut issues, &mut state,
+                                "Reparse point skipped (link, junction, mount point, or cloud placeholder)".into());
+                        }
+                        Ok(_) => match query(&child_path) {
+                            Err(e) => issue(
+                                &mut child,
+                                &child_path,
+                                &mut issues,
+                                &mut state,
+                                format!("Allocation/identity unavailable; allocation omitted: {e}"),
+                            ),
+                            Ok(info) if info.reparse || info.volume != root_device => {
+                                issue(
+                                    &mut child,
+                                    &child_path,
+                                    &mut issues,
+                                    &mut state,
+                                    "Reparse point or different volume skipped".into(),
+                                );
+                            }
+                            Ok(info) if info.directory != (child.kind == NodeKind::Directory) => {
+                                issue(
+                                    &mut child,
+                                    &child_path,
+                                    &mut issues,
+                                    &mut state,
+                                    "Entry changed type during scan; skipped".into(),
+                                );
+                            }
+                            Ok(info) => {
+                                let duplicate = !info.directory
+                                    && info.links > 1
+                                    && !seen.insert((info.volume, info.id));
+                                child.hard_link_duplicate = duplicate;
+                                child.own_allocated_bytes =
+                                    if duplicate { 0 } else { info.allocated };
+                                child.total_allocated_bytes = child.own_allocated_bytes;
+                                if info.directory {
+                                    pending.push(child_id);
+                                }
+                            }
+                        },
+                    }
+                    #[cfg(not(windows))]
                     match metadata {
                         Err(e) => issue(
                             &mut child,
@@ -679,5 +821,280 @@ mod tests {
             updates.last().unwrap().logical_bytes,
             s.nodes[s.root].total_logical_bytes
         );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_hardlinks_use_volume_and_file_identity() {
+        let t = Temp::new();
+        let original = t.0.join("original");
+        fs::write(&original, vec![42; 8192]).unwrap();
+        fs::hard_link(&original, t.0.join("duplicate")).unwrap();
+        let expected = crate::windows_fs::query(&original).unwrap();
+        assert!(expected.allocated > 0);
+        let s = t.scan();
+        assert!(s.issues.is_empty(), "{:?}", s.issues);
+        assert_eq!(s.nodes[0].total_logical_bytes, 16384);
+        assert_eq!(s.nodes[0].total_allocated_bytes, expected.allocated);
+        assert_eq!(s.nodes.iter().filter(|n| n.hard_link_duplicate).count(), 1);
+    }
+
+    // These Windows integration fixtures deliberately fail with diagnostics on
+    // unsupported filesystems; CI must use a local NTFS temp directory. Junction
+    // creation needs no symlink privilege, administrator rights, or Developer Mode.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("run Windows mklink");
+        assert!(
+            output.status.success(),
+            "junction fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_junctions_and_reparse_roots_are_not_followed() {
+        let t = Temp::new();
+        let outside = Temp::new();
+        fs::write(outside.0.join("must-not-appear"), b"outside").unwrap();
+        let link = t.0.join("junction");
+        junction(&link, &outside.0);
+        let s = t.scan();
+        assert_eq!(s.nodes.len(), 2);
+        assert_eq!(s.nodes[0].total_logical_bytes, 0);
+        assert_eq!(s.nodes[0].issue_count, 1);
+        assert!(scan(&link, &AtomicBool::new(false), |_| {}).is_err());
+        fs::create_dir(outside.0.join("nested")).unwrap();
+        assert!(scan(&link.join("nested"), &AtomicBool::new(false), |_| {}).is_err());
+        fs::remove_dir(&link).unwrap();
+        assert!(outside.0.join("must-not-appear").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_junction_cycle_is_bounded() {
+        let t = Temp::new();
+        let link = t.0.join("cycle");
+        junction(&link, &t.0);
+        let s = t.scan();
+        assert_eq!(s.nodes.len(), 2);
+        assert_eq!(s.nodes[0].issue_count, 1);
+        fs::remove_dir(link).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sparse_file_counts_physical_allocation() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::{Ioctl::FSCTL_SET_SPARSE, IO::DeviceIoControl};
+        let t = Temp::new();
+        let path = t.0.join("sparse");
+        let file = fs::File::create(&path).unwrap();
+        let mut returned = 0;
+        unsafe {
+            DeviceIoControl(
+                HANDLE(file.as_raw_handle()),
+                FSCTL_SET_SPARSE,
+                None,
+                0,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .expect("sparse fixture requires a local filesystem supporting sparse files (NTFS)");
+        file.set_len(64 * 1024 * 1024).unwrap();
+        drop(file);
+        let expected = crate::windows_fs::query(&path).unwrap().allocated;
+        assert!(expected < 64 * 1024 * 1024);
+        let s = t.scan();
+        assert!(s.issues.is_empty(), "{:?}", s.issues);
+        assert_eq!(s.nodes[1].own_logical_bytes, 64 * 1024 * 1024);
+        assert_eq!(s.nodes[1].own_allocated_bytes, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_compressed_file_counts_compressed_storage() {
+        use std::io::Write;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::{Ioctl::FSCTL_SET_COMPRESSION, IO::DeviceIoControl};
+        let t = Temp::new();
+        let path = t.0.join("compressed");
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let compression: u16 = 1; // COMPRESSION_FORMAT_DEFAULT
+        let mut returned = 0;
+        unsafe {
+            DeviceIoControl(
+                HANDLE(file.as_raw_handle()),
+                FSCTL_SET_COMPRESSION,
+                Some((&compression as *const u16).cast()),
+                2,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .expect("compressed fixture requires an NTFS volume supporting compression");
+        file.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let expected = crate::windows_fs::query(&path).unwrap().allocated;
+        assert!(expected < 1024 * 1024);
+        let s = t.scan();
+        assert!(s.issues.is_empty(), "{:?}", s.issues);
+        assert_eq!(s.nodes[1].own_allocated_bytes, expected);
+        assert_eq!(s.nodes[1].own_logical_bytes, 1024 * 1024);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_names_preserve_unicode_and_unpaired_utf16() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let t = Temp::new();
+        let name = OsString::from("资料 🦀 e\u{301}.txt");
+        let path = t.0.join(&name);
+        fs::write(&path, b"exact").unwrap();
+        let s = t.scan();
+        assert_eq!(s.nodes[1].name.as_ref(), name.as_os_str());
+        assert_eq!(s.path_for(1), path);
+        // Windows paths can contain unpaired surrogates. Keep exact code units
+        // in memory independently of the filesystem's filename restrictions.
+        let units = [b'x' as u16, 0xd800, b'y' as u16];
+        let n = make_node(
+            1,
+            Some(0),
+            OsString::from_wide(&units).into_boxed_os_str(),
+            None,
+            &mut HashSet::new(),
+        );
+        let path = reconstruct_path(&[s.nodes[0].clone(), n], &t.0, 1);
+        assert_eq!(
+            path.file_name().unwrap().encode_wide().collect::<Vec<_>>(),
+            units
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_unqueryable_files_remain_visible_with_issues() {
+        let t = Temp::new();
+        let path = t.0.join("unqueryable");
+        fs::write(&path, b"visible metadata").unwrap();
+        let mut failures = 0;
+        let s = scan_impl(
+            &t.0,
+            &AtomicBool::new(false),
+            |_| {},
+            |candidate| {
+                if candidate == path {
+                    failures += 1;
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected metadata denial",
+                    ))
+                } else {
+                    crate::windows_fs::query(candidate)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(failures, 1);
+        assert_eq!(s.nodes.len(), 2);
+        let child = &s.nodes[1];
+        assert_eq!(child.kind, NodeKind::File);
+        assert_eq!(child.own_logical_bytes, 16);
+        assert_eq!(child.own_allocated_bytes, 0);
+        assert_eq!(child.issue_count, 1);
+        assert!(child
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Allocation/identity unavailable"));
+        assert_eq!(s.nodes[0].issue_count, 1);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_exclusive_data_lock_does_not_require_file_data_access() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let t = Temp::new();
+        let path = t.0.join("locked");
+        fs::write(&path, b"visible metadata").unwrap();
+        let expected = crate::windows_fs::query(&path).unwrap().allocated;
+        let _lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        // Windows permits FILE_READ_ATTRIBUTES despite exclusive data sharing.
+        // This protects the metadata-only contract against accidental widening.
+        let s = t.scan();
+        assert!(s.issues.is_empty(), "{:?}", s.issues);
+        assert_eq!(s.nodes.len(), 2);
+        assert_eq!(s.nodes[1].kind, NodeKind::File);
+        assert_eq!(s.nodes[1].own_logical_bytes, 16);
+        assert_eq!(s.nodes[1].own_allocated_bytes, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_replaced_by_junction_is_rechecked() {
+        let t = Temp::new();
+        let outside = Temp::new();
+        fs::write(outside.0.join("must-not-appear"), b"outside").unwrap();
+        let saved = t.0.with_extension("saved");
+        let mut replaced = false;
+        let result = scan(&t.0, &AtomicBool::new(false), |_| {
+            if !replaced {
+                fs::rename(&t.0, &saved).unwrap();
+                junction(&t.0, &outside.0);
+                replaced = true;
+            }
+        });
+        // Restore the fixture before assertions, so normal cleanup cannot follow
+        // the junction even on an assertion failure.
+        fs::remove_dir(&t.0).unwrap();
+        fs::rename(&saved, &t.0).unwrap();
+        let s = result.unwrap();
+        assert_eq!(s.nodes.len(), 1);
+        assert_eq!(s.nodes[0].issue_count, 1);
+        assert!(s.nodes[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("reparse point"));
+        assert!(outside.0.join("must-not-appear").exists());
+    }
+    #[test]
+    fn hardlink_key_preserves_platform_storage_width() {
+        #[cfg(unix)]
+        assert_eq!(std::mem::size_of::<FileKey>(), 16);
+        #[cfg(windows)]
+        assert_eq!(std::mem::size_of::<FileKey>(), 32);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_relative_roots_are_rejected() {
+        for path in [r"C:folder", "C:", r"Z:relative\nested"] {
+            let error = scan(Path::new(path), &AtomicBool::new(false), |_| {}).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("Drive-relative"));
+        }
     }
 }

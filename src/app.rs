@@ -14,6 +14,7 @@ use tree_lens::{
     deletion::DeletionRequest,
     footprint::{self, Tile},
     format_bytes,
+    platform::{self, DELETE_LABEL, TRASH_NAME, TRASH_SUPPORTED},
     scanner::{NodeId, NodeKind},
     session::{expand_home, Session},
     tree::SortBy,
@@ -63,10 +64,14 @@ pub fn install_theme(cx: &mut App) {
         theme.colors.accent_foreground = rgb(CYAN).into();
     });
     cx.bind_keys([
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-o", OpenFolder, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-r", Refresh, None),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-f", FocusSearch, None),
         KeyBinding::new("escape", CancelScan, Some("TreeLens")),
+        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-q", Quit, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-o", OpenFolder, None),
@@ -74,6 +79,8 @@ pub fn install_theme(cx: &mut App) {
         KeyBinding::new("ctrl-r", Refresh, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-f", FocusSearch, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-q", Quit, None),
     ]);
 }
 
@@ -278,10 +285,21 @@ impl TreeLensApp {
                 self.session.status = format!("无法打开 Finder：{error}");
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        if let Some(scan) = &self.session.result {
+            // GPUI uses the Windows shell's PIDL API, not shell command strings.
+            let path = scan.path_for(id);
+            if path.parent().is_none() {
+                // Drive/UNC-share roots have no parent item to select.
+                cx.open_with_system(&path);
+            } else {
+                cx.reveal_path(&path);
+            }
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             let _ = id;
-            self.session.status = "Finder 功能仅适用于 macOS。".into();
+            self.session.status = "原生文件管理器显示仅支持 macOS 和 Windows。".into();
         }
         cx.notify();
     }
@@ -339,13 +357,13 @@ impl TreeLensApp {
                 })
                 .child(
                     div().flex().flex_col().gap_3().text_sm()
-                        .child("这个文件夹及其全部内容将移到 macOS 废纸篓，不会永久删除。")
+                        .child(format!("这个文件夹及其全部内容将移到{TRASH_NAME}，不会永久删除。"))
                         .child(div().id("delete-path").test_support().max_h(px(160.0))
                             .overflow_y_scroll().p_3().rounded_lg().bg(rgb(0x192632))
                             .child(path.clone()))
                         .child(format!("扫描时的磁盘占用：{size}。包含所有内容，即使被筛选或未完整扫描。"))
                         .child(div().text_color(rgb(AMBER)).child(
-                            "可在 Finder 的废纸篓中恢复。移入废纸篓不会立即释放空间；本应用不会清空废纸篓。")),
+                            format!("可在系统{TRASH_NAME}中恢复。移入{TRASH_NAME}不会立即释放空间；本应用不会清空{TRASH_NAME}。"))),
                 )
                 .footer(
                     div().flex().justify_end().gap_2()
@@ -357,7 +375,7 @@ impl TreeLensApp {
                                 });
                                 window.close_dialog(cx);
                             }))
-                        .child(Button::new("delete-confirm").danger().label("移到废纸篓")
+                        .child(Button::new("delete-confirm").danger().label(format!("移到{TRASH_NAME}"))
                             .on_click(move |_, window, cx| {
                                 let _ = confirm_view.update(cx, |this, cx| {
                                     this.confirm_delete(window, cx);
@@ -409,7 +427,7 @@ impl TreeLensApp {
             Ok(_) => {
                 self.deletion = Some(receiver);
                 self.deletion_notice = None;
-                self.session.status = "正在移到废纸篓…请勿移动或重命名此文件夹。".into();
+                self.session.status = format!("正在移到{TRASH_NAME}…请勿移动或重命名此文件夹。");
             }
             Err(error) => self.session.status = format!("无法启动删除操作：{error}"),
         }
@@ -420,7 +438,8 @@ impl TreeLensApp {
         let result = match self.deletion.as_ref().map(|receiver| receiver.try_recv()) {
             Some(Ok(result)) => result,
             Some(Err(mpsc::TryRecvError::Disconnected)) => Err(
-                "删除线程意外结束。请在 Finder 中确认文件夹的位置，再刷新；不会自动重试。".into(),
+                "删除线程意外结束。请在系统文件管理器中确认文件夹的位置，再刷新；不会自动重试。"
+                    .into(),
             ),
             _ => return,
         };
@@ -432,11 +451,12 @@ impl TreeLensApp {
                 if let Some(root) = self.session.root_path.clone() {
                     self.start(root, window, cx);
                 }
-                self.deletion_notice = Some("已移到废纸篓，可在 Finder 中恢复".into());
+                self.deletion_notice =
+                    Some(format!("已移到{TRASH_NAME}，可在系统{TRASH_NAME}中恢复"));
             }
             Err(error) => {
                 self.deletion_notice = None;
-                self.session.status = format!("未能确认移到废纸篓：{error} 请检查后刷新。");
+                self.session.status = format!("未能确认移到{TRASH_NAME}：{error} 请检查后刷新。");
             }
         }
         cx.notify();
@@ -497,8 +517,12 @@ impl TreeLensApp {
                     .icon(IconName::Folder)
                     .disabled(busy)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(home) = std::env::var_os("HOME") {
-                            this.start(PathBuf::from(home).join(suffix), window, cx);
+                        if let Some(path) = platform::shortcut_path(suffix) {
+                            this.start(path, window, cx);
+                        } else {
+                            this.session.status =
+                                "无法定位此系统文件夹，请使用文件夹选择器。".into();
+                            cx.notify();
                         }
                     })),
             );
@@ -524,7 +548,7 @@ impl TreeLensApp {
                 div()
                     .text_xs()
                     .text_color(rgb(0x63778c))
-                    .child("GPUI KIT / 0.3.1"),
+                    .child("GPUI KIT / 0.4.0"),
             )
     }
 
@@ -580,7 +604,11 @@ impl TreeLensApp {
                             .icon(IconName::FolderOpen)
                             .label("选择文件夹")
                             .disabled(busy || self.choosing)
-                            .tooltip("选择文件夹 · ⌘O")
+                            .tooltip(if cfg!(target_os = "macos") {
+                                "选择文件夹 · ⌘O"
+                            } else {
+                                "选择文件夹 · Ctrl+O"
+                            })
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.choose_folder(window, cx)),
                             ),
@@ -618,7 +646,11 @@ impl TreeLensApp {
                     } else {
                         Button::new("refresh")
                             .icon(IconName::RotateCw)
-                            .tooltip("重新扫描 · ⌘R")
+                            .tooltip(if cfg!(target_os = "macos") {
+                                "重新扫描 · ⌘R"
+                            } else {
+                                "重新扫描 · Ctrl+R"
+                            })
                             .disabled(busy || self.session.root_path.is_none())
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx)))
                     }),
@@ -1002,7 +1034,7 @@ impl TreeLensApp {
         let selected = self.session.selected == Some(id);
         let view = cx.entity().downgrade();
         let generation = self.generation;
-        let delete_enabled = cfg!(target_os = "macos") && self.deletable_folder(id);
+        let delete_enabled = TRASH_SUPPORTED && self.deletable_folder(id);
         let icon = match node.kind {
             NodeKind::Directory => IconName::Folder,
             NodeKind::Symlink => IconName::ExternalLink,
@@ -1146,20 +1178,20 @@ impl TreeLensApp {
                         });
                     }),
                 )
-                .when(cfg!(target_os = "macos"), |menu| {
-                    menu.item(
-                        PopupMenuItem::new("在 Finder 中显示").on_click(move |_, _, cx| {
+                .when(TRASH_SUPPORTED, |menu| {
+                    menu.item(PopupMenuItem::new(platform::REVEAL_LABEL).on_click(
+                        move |_, _, cx| {
                             let _ = reveal_view.update(cx, |this, cx| {
                                 if this.generation == generation {
                                     this.reveal(id, cx);
                                 }
                             });
-                        }),
-                    )
+                        },
+                    ))
                 })
                 .when(directory, |menu| {
                     menu.separator().item(
-                        PopupMenuItem::new("删除文件夹…（移到废纸篓）")
+                        PopupMenuItem::new(DELETE_LABEL)
                             .disabled(!delete_enabled)
                             .on_click(move |_, window, cx| {
                                 let _ = delete_view.update(cx, |this, cx| {
@@ -1315,10 +1347,10 @@ impl TreeLensApp {
                         .icon(IconName::Copy)
                         .on_click(cx.listener(move |this, _, _, cx| this.copy_path(id, cx))),
                 )
-                .when(cfg!(target_os = "macos"), |panel| {
+                .when(TRASH_SUPPORTED, |panel| {
                     panel.child(
                         Button::new("reveal-selected")
-                            .label("在 Finder 中显示")
+                            .label(platform::REVEAL_LABEL)
                             .icon(IconName::ExternalLink)
                             .on_click(cx.listener(move |this, _, _, cx| this.reveal(id, cx))),
                     )
@@ -1328,13 +1360,13 @@ impl TreeLensApp {
                         Button::new("delete-selected")
                             .danger()
                             .label("删除文件夹…")
-                            .disabled(!cfg!(target_os = "macos") || !self.deletable_folder(id))
+                            .disabled(!TRASH_SUPPORTED || !self.deletable_folder(id))
                             .tooltip(if id == scan.root {
                                 "不能删除当前扫描根目录；请先扫描它的父文件夹。"
-                            } else if !cfg!(target_os = "macos") {
-                                "移到废纸篓仅支持 macOS。"
+                            } else if !TRASH_SUPPORTED {
+                                "移到系统回收站/废纸篓仅支持 macOS 和 Windows。"
                             } else {
-                                "确认后将整个文件夹移到废纸篓，不永久删除。"
+                                "确认后将整个文件夹移到系统回收站/废纸篓，不永久删除。"
                             })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.request_delete(id, window, cx);
@@ -1353,13 +1385,13 @@ impl TreeLensApp {
             div()
                 .text_size(px(10.0))
                 .text_color(rgb(MUTED))
-                .child("APFS 共享块、快照与压缩可能影响分配量。此数值不代表可释放空间。"),
+                .child(platform::STORAGE_CAVEAT),
         )
     }
 
     fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let status = if self.deletion.is_some() {
-            "正在移到废纸篓…请勿移动或重命名此文件夹。".into()
+            format!("正在移到{TRASH_NAME}…请勿移动或重命名此文件夹。")
         } else if self.session.busy() {
             format!(
                 "已检查 {} 个项目 · {}",
@@ -1466,12 +1498,12 @@ impl TreeLensApp {
                 }
             } else {
                 for line in [
-                    "Tree Lens 0.3.1 · 原生 Rust / GPUI Kit 0.9",
-                    "扫描只读取文件系统元数据，不读取文件内容，不上传结果。删除文件夹需单独确认，并仅移到 macOS 废纸篓。",
-                    "磁盘占用来自已分配块数 × 512；逻辑大小为文件长度。硬链接分配空间在同次扫描中去重。",
+                    "Tree Lens 0.4.0 · 原生 Rust / GPUI Kit 0.9",
+                    "扫描只读取文件系统元数据，不读取文件内容，不上传结果。删除文件夹需单独确认，仅移到系统回收站/废纸篓。",
+                    platform::ALLOCATION_HELP,
                     "不跟随符号链接，不跨入不同设备的挂载点。扫描取消或发生权限错误时，结果只是已扫描部分。",
-                    "APFS 克隆、快照、压缩与共享块无法精确归属，所以统计值不等于删除后能释放的空间。",
-                    "快捷键：⌘O 选择文件夹 · ⌘R 刷新 · ⌘F 筛选 · Esc 关闭说明或取消扫描。",
+                    platform::STORAGE_CAVEAT,
+                    platform::SHORTCUT_HELP,
                     "空间地图展示当前目录直接子项；虚拟文件树仅为当前视口构造行。",
                 ] { content = content.child(line); }
             }
@@ -1634,7 +1666,7 @@ fn format_count(value: u64) -> String {
 
 #[cfg(all(test, feature = "ui-tests"))]
 mod ui_tests {
-    use super::{install_theme, TreeLensApp};
+    use super::{install_theme, TreeLensApp, DELETE_LABEL, TRASH_NAME, TRASH_SUPPORTED};
     use gpui_kit::component::WindowExt;
     use gpui_kit::test::{TestQueryExt, TestWindowExt};
     use gpui_kit::{
@@ -1707,6 +1739,26 @@ mod ui_tests {
     }
 
     #[gpui_kit::test]
+    fn platform_refresh_shortcut_and_escape_work(cx: &mut TestAppContext) {
+        let (handle, view) = fixture(cx, 1080.0, true);
+        cx.update_window(handle, |_, window, cx| {
+            let generation = view.read(cx).generation;
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-r"
+                } else {
+                    "ctrl-r"
+                },
+                cx,
+            );
+            assert_eq!(view.read(cx).generation, generation.wrapping_add(1));
+            window.press("escape", cx);
+            assert!(view.read(cx).session.cancelling() || !view.read(cx).session.busy());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn loaded_view_sorts_and_keeps_input_state(cx: &mut TestAppContext) {
         let (handle, view) = fixture(cx, 1440.0, true);
         cx.update_window(handle, |_, window, cx| {
@@ -1766,14 +1818,20 @@ mod ui_tests {
     struct TrashFixture(PathBuf);
     impl TrashFixture {
         fn new() -> Self {
+            // Wall-clock resolution varies by OS. Parallel tests must never
+            // share a directory, even when they observe the same timestamp.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
-                "tree-lens-ui-trash-{}-{}",
+                "tree-lens-ui-trash-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
+            // Claim the unique root atomically rather than silently reusing it.
+            std::fs::create_dir(&root).unwrap();
             std::fs::create_dir_all(root.join("scan/folder-to-trash")).unwrap();
             std::fs::write(root.join("scan/folder-to-trash/content.txt"), b"synthetic").unwrap();
             Self(root)
@@ -1856,7 +1914,9 @@ mod ui_tests {
             assert!(view.read(cx).deletion.is_none());
             assert!(view.read(cx).pending_deletion.is_none());
             view.update(cx, |app, cx| app.request_delete(id, window, cx));
-            window.click("close", cx);
+            // Windows also has a title-bar Close button with this local ID.
+            window.render_frame(cx);
+            window.within("dialog-close").click("close", cx);
             assert!(!window.has_active_dialog(cx));
             assert!(view.read(cx).pending_deletion.is_none());
             view.update(cx, |app, cx| app.request_delete(id, window, cx));
@@ -1894,7 +1954,7 @@ mod ui_tests {
                 let scan = app.session.result.as_ref().unwrap();
                 assert_eq!(app.session.selected, Some(scan.root));
                 assert_eq!(scan.nodes.len(), 1);
-                assert!(app.deletion_notice.as_ref().unwrap().contains("废纸篓"));
+                assert!(app.deletion_notice.as_ref().unwrap().contains(TRASH_NAME));
                 assert!(app.search_input.read(cx).value().is_empty());
             });
         })
@@ -1962,7 +2022,7 @@ mod ui_tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let item = window.find_by_label("删除文件夹…（移到废纸篓）");
+            let item = window.find_by_label(DELETE_LABEL);
             assert!(item.visible());
             window.click(item.path().last().unwrap().clone(), cx);
             assert!(view.read(cx).pending_deletion.is_none());
@@ -1975,13 +2035,10 @@ mod ui_tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let item = window.find_by_label("删除文件夹…（移到废纸篓）");
+            let item = window.find_by_label(DELETE_LABEL);
             assert!(item.visible());
             window.click(item.path().last().unwrap().clone(), cx);
-            assert_eq!(
-                view.read(cx).pending_deletion.is_some(),
-                cfg!(target_os = "macos")
-            );
+            assert_eq!(view.read(cx).pending_deletion.is_some(), TRASH_SUPPORTED);
             window.press("escape", cx);
             assert!(view.read(cx).pending_deletion.is_none());
         })

@@ -1818,14 +1818,20 @@ mod ui_tests {
     struct TrashFixture(PathBuf);
     impl TrashFixture {
         fn new() -> Self {
+            // Wall-clock resolution varies by OS. Parallel tests must never
+            // share a directory, even when they observe the same timestamp.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
-                "tree-lens-ui-trash-{}-{}",
+                "tree-lens-ui-trash-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
+            // Claim the unique root atomically rather than silently reusing it.
+            std::fs::create_dir(&root).unwrap();
             std::fs::create_dir_all(root.join("scan/folder-to-trash")).unwrap();
             std::fs::write(root.join("scan/folder-to-trash/content.txt"), b"synthetic").unwrap();
             Self(root)

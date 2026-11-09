@@ -225,7 +225,24 @@ fn count(node: &Node, state: &mut ScanProgress) {
 pub fn scan(
     path: &Path,
     cancel: &AtomicBool,
+    progress: impl FnMut(ScanProgress),
+) -> io::Result<ScanOutcome> {
+    scan_impl(
+        path,
+        cancel,
+        progress,
+        #[cfg(windows)]
+        crate::windows_fs::query,
+    )
+}
+
+// The Windows query seam allows deterministic filesystem-failure tests without
+// requesting file-data access or changing ACLs on the test runner.
+fn scan_impl(
+    path: &Path,
+    cancel: &AtomicBool,
     mut progress: impl FnMut(ScanProgress),
+    #[cfg(windows)] mut query: impl FnMut(&Path) -> io::Result<crate::windows_fs::EntryInfo>,
 ) -> io::Result<ScanOutcome> {
     let start = Instant::now();
     #[cfg(windows)]
@@ -267,7 +284,7 @@ pub fn scan(
                 return Err(io::Error::other("Root has a reparse-point ancestor"));
             }
         }
-        let info = crate::windows_fs::query(&path)?;
+        let info = query(&path)?;
         if info.reparse || !info.directory {
             return Err(io::Error::other("Root changed type or is a reparse point"));
         }
@@ -297,7 +314,7 @@ pub fn scan(
         latest_id = id;
         // Recheck before opening: directories may have changed since discovery.
         #[cfg(windows)]
-        let checked = crate::windows_fs::query(&directory_path).and_then(|info| {
+        let checked = query(&directory_path).and_then(|info| {
             if !info.directory || info.reparse || info.volume != root_device {
                 Err(io::Error::other(
                     "Directory changed type, became a reparse point, or changed volume; skipped",
@@ -399,7 +416,7 @@ pub fn scan(
                             issue(&mut child, &child_path, &mut issues, &mut state,
                                 "Reparse point skipped (link, junction, mount point, or cloud placeholder)".into());
                         }
-                        Ok(_) => match crate::windows_fs::query(&child_path) {
+                        Ok(_) => match query(&child_path) {
                             Err(e) => issue(
                                 &mut child,
                                 &child_path,
@@ -976,16 +993,28 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_unqueryable_files_remain_visible_with_issues() {
-        use std::os::windows::fs::OpenOptionsExt;
         let t = Temp::new();
-        let path = t.0.join("locked");
+        let path = t.0.join("unqueryable");
         fs::write(&path, b"visible metadata").unwrap();
-        let _lock = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&path)
-            .unwrap();
-        let s = t.scan();
+        let mut failures = 0;
+        let s = scan_impl(
+            &t.0,
+            &AtomicBool::new(false),
+            |_| {},
+            |candidate| {
+                if candidate == path {
+                    failures += 1;
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected metadata denial",
+                    ))
+                } else {
+                    crate::windows_fs::query(candidate)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(failures, 1);
         assert_eq!(s.nodes.len(), 2);
         let child = &s.nodes[1];
         assert_eq!(child.kind, NodeKind::File);
@@ -999,6 +1028,29 @@ mod tests {
             .contains("Allocation/identity unavailable"));
         assert_eq!(s.nodes[0].issue_count, 1);
     }
+    #[cfg(windows)]
+    #[test]
+    fn windows_exclusive_data_lock_does_not_require_file_data_access() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let t = Temp::new();
+        let path = t.0.join("locked");
+        fs::write(&path, b"visible metadata").unwrap();
+        let expected = crate::windows_fs::query(&path).unwrap().allocated;
+        let _lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        // Windows permits FILE_READ_ATTRIBUTES despite exclusive data sharing.
+        // This protects the metadata-only contract against accidental widening.
+        let s = t.scan();
+        assert!(s.issues.is_empty(), "{:?}", s.issues);
+        assert_eq!(s.nodes.len(), 2);
+        assert_eq!(s.nodes[1].kind, NodeKind::File);
+        assert_eq!(s.nodes[1].own_logical_bytes, 16);
+        assert_eq!(s.nodes[1].own_allocated_bytes, expected);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_directory_replaced_by_junction_is_rechecked() {

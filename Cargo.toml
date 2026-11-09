@@ -1,10 +1,10 @@
 [package]
 name = "tree-lens"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 resolver = "3"
 rust-version = "1.92"
-description = "A native GPUI Kit disk usage observatory for macOS and Windows"
+description = "A native GPUI Kit disk usage observatory for macOS, Windows, Debian and Ubuntu"
 license = "MIT"
 
 [features]

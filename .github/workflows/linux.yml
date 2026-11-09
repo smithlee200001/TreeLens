@@ -1,0 +1,83 @@
+name: Debian and Ubuntu checks
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            label: Debian-12-amd64
+          - image: debian:13
+            label: Debian-13-amd64
+          - image: ubuntu:22.04
+            label: Ubuntu-22.04-amd64
+          - image: ubuntu:24.04
+            label: Ubuntu-24.04-amd64
+    container: ${{ matrix.image }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - name: Bootstrap checkout tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@v4
+      - name: Install native distro build and runtime dependencies
+        run: bash scripts/install-linux-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Formatting and packaging syntax
+        run: |
+          cargo fmt --all -- --check
+          bash -n scripts/install-linux-deps.sh scripts/bundle-linux.sh
+          desktop-file-validate packaging/linux/local.treelens.app.desktop
+      - name: Core filesystem and deletion regression tests
+        run: cargo test --locked --no-default-features --lib
+      - name: Isolated GIO Trash round-trip
+        run: cargo test --locked --no-default-features --lib linux_gio_round_trip_in_isolated_trash -- --ignored
+      - name: Linux socket scan regression
+        run: cargo test --locked --no-default-features --lib linux_socket_is_not_opened_for_reading -- --ignored
+      - name: Core and headless GPUI interaction tests
+        run: cargo test --locked --features ui-tests --all-targets
+      - name: Strict Clippy
+        run: cargo clippy --locked --features ui-tests --all-targets -- -D warnings
+      - name: Build release GUI and distro-specific packages
+        run: bash scripts/bundle-linux.sh
+      - name: Verify package payload and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          debs=(dist/*.deb)
+          test "${#debs[@]}" = 1
+          dpkg-deb --contents "${debs[0]}"
+          dpkg-deb --field "${debs[0]}" Depends
+          mkdir /tmp/tree-lens-package-check
+          dpkg-deb --extract "${debs[0]}" /tmp/tree-lens-package-check
+          test -x /tmp/tree-lens-package-check/usr/bin/tree-lens
+          desktop-file-validate /tmp/tree-lens-package-check/usr/share/applications/local.treelens.app.desktop
+          ldd /tmp/tree-lens-package-check/usr/bin/tree-lens | tee /tmp/tree-lens-ldd.txt
+          ! grep -q 'not found' /tmp/tree-lens-ldd.txt
+          apt-get install -y --no-install-recommends "./${debs[0]}"
+          test -x /usr/bin/tree-lens
+          /usr/bin/tree-lens --version
+          /usr/bin/tree-lens --help
+          test -x /usr/bin/gio
+          test -x /usr/bin/xdg-user-dir
+          test -x /usr/bin/xdg-open
+          cd dist && sha256sum --check ./*.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tree-Lens-${{ matrix.label }}-development
+          path: dist/
+          if-no-files-found: error

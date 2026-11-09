@@ -6,7 +6,21 @@ use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 
 fn main() {
-    let initial_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next();
+    if first.as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        println!("Tree Lens {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if first.as_deref() == Some(std::ffi::OsStr::new("--help")) {
+        println!("Tree Lens {}\nUsage: tree-lens [DIRECTORY]\n       tree-lens --version\n\nNative disk usage viewer. A desktop session and graphics driver are required.\nScanning is read-only; moving a folder to Trash requires confirmation in the GUI.", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.next().is_some() {
+        eprintln!("Only one directory may be opened. Usage: tree-lens [DIRECTORY]");
+        std::process::exit(2);
+    }
+    let initial_path = first.map(std::path::PathBuf::from);
     application().with_assets(assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);

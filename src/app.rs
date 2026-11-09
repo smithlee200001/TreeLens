@@ -296,10 +296,23 @@ impl TreeLensApp {
                 cx.reveal_path(&path);
             }
         }
-        #[cfg(not(any(target_os = "macos", windows)))]
+        #[cfg(target_os = "linux")]
+        if let Some(scan) = &self.session.result {
+            // GPUI opens the given path before invoking the desktop portal.
+            // Pass only a directory: opening a FIFO/device/file here is unsafe,
+            // and dangling links or unreadable files should still reveal a parent.
+            let path = scan.path_for(id);
+            let directory = if scan.nodes[id].kind == NodeKind::Directory {
+                path.as_path()
+            } else {
+                path.parent().unwrap_or(&path)
+            };
+            cx.reveal_path(directory);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             let _ = id;
-            self.session.status = "原生文件管理器显示仅支持 macOS 和 Windows。".into();
+            self.session.status = "此平台尚不支持原生文件管理器显示。".into();
         }
         cx.notify();
     }
@@ -1364,7 +1377,7 @@ impl TreeLensApp {
                             .tooltip(if id == scan.root {
                                 "不能删除当前扫描根目录；请先扫描它的父文件夹。"
                             } else if !TRASH_SUPPORTED {
-                                "移到系统回收站/废纸篓仅支持 macOS 和 Windows。"
+                                "此平台尚不支持移到系统回收站/废纸篓。"
                             } else {
                                 "确认后将整个文件夹移到系统回收站/废纸篓，不永久删除。"
                             })

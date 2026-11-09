@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.5.0 · Debian / Ubuntu support (2026-11-09)
+
+- Add Linux desktop integration, XDG localized/redirected user folders, Ctrl shortcuts and correct platform copy.
+- Preserve Unix allocated-block and hardlink accounting, skip same-device bind mounts, and reject symlink ancestors on Linux.
+- Add explicit-confirmation FreeDesktop Trash through GIO, fail closed on missing mount information, reject mount points/contained mounts, and never fall back to permanent deletion.
+- Add Debian 12/13 and Ubuntu 22.04/24.04 CI, native distro-specific .deb/tar packaging, desktop entry, icon, dependency and validation documentation.
+- Retain merged Windows/macOS support, compact tree storage and virtualized UI. See TESTING.md for evidence and untested targets.
+
 ## 0.4.0 · Windows support (2026-11-09)
 
 - Add Windows x64 MSVC target, native folder picker, Explorer reveal, Known Folder shortcuts and Ctrl keyboard shortcuts.

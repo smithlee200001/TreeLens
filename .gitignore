@@ -2,3 +2,5 @@
 /target-core/
 /dist/
 .DS_Store
+
+/target-trash/

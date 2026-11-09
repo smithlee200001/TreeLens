@@ -1,6 +1,6 @@
 //! Iterative, read-only filesystem accounting. Symlinks are never intentionally
 //! followed and child mount points are not traversed. This is a best-effort view
-//! of a live filesystem, not an atomic snapshot. APFS clones/compression may share
+//! of a live filesystem, not an atomic snapshot. Clones/compression/snapshots may share
 //! blocks that cannot be attributed exactly using portable filesystem metadata.
 
 use std::borrow::Cow;
@@ -159,6 +159,7 @@ fn make_node(
     name: Box<OsStr>,
     metadata: Option<&Metadata>,
     seen: &mut HashSet<FileKey>,
+    account: bool,
 ) -> Node {
     let kind = match metadata {
         Some(m) if m.file_type().is_symlink() => NodeKind::Symlink,
@@ -166,8 +167,12 @@ fn make_node(
         Some(m) if m.is_file() => NodeKind::File,
         _ => NodeKind::Other,
     };
-    let logical = metadata.map_or(0, |m| if m.is_dir() { 0 } else { m.len() });
-    let (allocated, duplicate) = metadata.map_or((0, false), |m| sizes(m, seen));
+    let logical = metadata.map_or(0, |m| if !account || m.is_dir() { 0 } else { m.len() });
+    let (allocated, duplicate) = if account {
+        metadata.map_or((0, false), |m| sizes(m, seen))
+    } else {
+        (0, false)
+    };
     Node {
         id,
         parent,
@@ -178,8 +183,8 @@ fn make_node(
         own_allocated_bytes: allocated,
         total_logical_bytes: logical,
         total_allocated_bytes: allocated,
-        file_count: u64::from(kind == NodeKind::File),
-        directory_count: u64::from(kind == NodeKind::Directory),
+        file_count: u64::from(account && kind == NodeKind::File),
+        directory_count: u64::from(account && kind == NodeKind::Directory),
         issue_count: 0,
         error: None,
         hard_link_duplicate: duplicate,
@@ -231,6 +236,8 @@ pub fn scan(
         path,
         cancel,
         progress,
+        #[cfg(target_os = "linux")]
+        None,
         #[cfg(windows)]
         crate::windows_fs::query,
     )
@@ -242,6 +249,7 @@ fn scan_impl(
     path: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(ScanProgress),
+    #[cfg(target_os = "linux")] mount_table: Option<crate::linux_fs::MountTable>,
     #[cfg(windows)] mut query: impl FnMut(&Path) -> io::Result<crate::windows_fs::EntryInfo>,
 ) -> io::Result<ScanOutcome> {
     let start = Instant::now();
@@ -264,6 +272,17 @@ fn scan_impl(
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
+    };
+    #[cfg(target_os = "linux")]
+    let (path, mount_table) = {
+        crate::linux_fs::validate_directory_ancestors(&path)?;
+        // Normalize dot components only after rejecting every symlink ancestor.
+        let path = fs::canonicalize(path)?;
+        let table = match mount_table {
+            Some(table) => table,
+            None => crate::linux_fs::MountTable::read()?,
+        };
+        (path, table)
     };
     let metadata = fs::symlink_metadata(&path)?;
     if !metadata.is_dir() {
@@ -294,7 +313,14 @@ fn scan_impl(
     let root_device = device(&metadata);
     let mut seen = HashSet::new();
     let root_name = path.file_name().unwrap_or(path.as_os_str()).into();
-    let mut nodes = vec![make_node(0, None, root_name, Some(&metadata), &mut seen)];
+    let mut nodes = vec![make_node(
+        0,
+        None,
+        root_name,
+        Some(&metadata),
+        &mut seen,
+        true,
+    )];
     let root_path = path;
     let mut latest_id = 0;
     let mut pending = vec![0];
@@ -313,6 +339,17 @@ fn scan_impl(
         let directory_path = reconstruct_path(&nodes, &root_path, id);
         latest_id = id;
         // Recheck before opening: directories may have changed since discovery.
+        #[cfg(target_os = "linux")]
+        if let Err(error) = crate::linux_fs::validate_directory_ancestors(&directory_path) {
+            issue(
+                &mut nodes[id],
+                &directory_path,
+                &mut issues,
+                &mut state,
+                format!("Directory or ancestor changed; skipped: {error}"),
+            );
+            continue;
+        }
         #[cfg(windows)]
         let checked = query(&directory_path).and_then(|info| {
             if !info.directory || info.reparse || info.volume != root_device {
@@ -395,6 +432,13 @@ fn scan_impl(
                     let metadata = entry.metadata();
                     #[cfg(not(windows))]
                     let metadata = fs::symlink_metadata(&child_path);
+                    // File bind mounts must be skipped too, before touching the
+                    // hardlink set, or they could steal attribution from real files.
+                    #[cfg(target_os = "linux")]
+                    let excluded_mount = mount_table.contains(&child_path)
+                        || metadata.as_ref().is_ok_and(|m| device(m) != root_device);
+                    #[cfg(not(target_os = "linux"))]
+                    let excluded_mount = false;
                     let child_id = nodes.len();
                     let mut child = make_node(
                         child_id,
@@ -402,6 +446,7 @@ fn scan_impl(
                         entry.file_name().into_boxed_os_str(),
                         metadata.as_ref().ok(),
                         &mut seen,
+                        !excluded_mount,
                     );
                     #[cfg(windows)]
                     match metadata {
@@ -464,6 +509,14 @@ fn scan_impl(
                             &mut issues,
                             &mut state,
                             e.to_string(),
+                        ),
+                        #[cfg(target_os = "linux")]
+                        Ok(_) if excluded_mount => issue(
+                            &mut child,
+                            &child_path,
+                            &mut issues,
+                            &mut state,
+                            "Mount point skipped (including file/directory bind mounts)".into(),
                         ),
                         Ok(m) if child.kind == NodeKind::Directory => {
                             if device(&m) != root_device {
@@ -561,6 +614,128 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bind_mount_is_visible_but_not_counted_or_traversed() {
+        let temp = Temp::new();
+        let mounted = temp.0.join("bind");
+        fs::create_dir(&mounted).unwrap();
+        fs::write(mounted.join("must-not-count"), vec![1u8; 8192]).unwrap();
+        fs::write(temp.0.join("ordinary"), b"ok").unwrap();
+        let table = crate::linux_fs::MountTable::parse(
+            format!(
+                "1 0 0:1 / / rw - tmpfs tmpfs rw\n2 1 0:1 /source {} rw - tmpfs tmpfs rw\n",
+                mounted.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let scan = scan_impl(&temp.0, &AtomicBool::new(false), |_| {}, Some(table)).unwrap();
+        let node = scan
+            .nodes
+            .iter()
+            .find(|node| node.name.as_ref() == OsStr::new("bind"))
+            .unwrap();
+        assert!(node.children.is_empty());
+        assert_eq!(node.total_allocated_bytes, 0);
+        assert_eq!(node.issue_count, 1);
+        assert_eq!(scan.nodes[scan.root].total_logical_bytes, 2);
+        assert_eq!(scan.nodes[scan.root].file_count, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_file_bind_mount_does_not_steal_hardlink_allocation() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = Temp::new();
+        let regular = temp.0.join("ordinary");
+        let mounted = temp.0.join("file-mount");
+        fs::write(&regular, vec![7u8; 8192]).unwrap();
+        fs::hard_link(&regular, &mounted).unwrap();
+        let table = crate::linux_fs::MountTable::parse(
+            format!(
+                "1 0 0:1 / / rw - tmpfs tmpfs rw\n2 1 0:1 /source {} rw - tmpfs tmpfs rw\n",
+                mounted.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let scan = scan_impl(&temp.0, &AtomicBool::new(false), |_| {}, Some(table)).unwrap();
+        let excluded = scan
+            .nodes
+            .iter()
+            .find(|n| n.name.as_ref() == OsStr::new("file-mount"))
+            .unwrap();
+        assert_eq!(excluded.kind, NodeKind::File);
+        assert_eq!(excluded.total_allocated_bytes, 0);
+        assert_eq!(excluded.total_logical_bytes, 0);
+        assert_eq!(excluded.file_count, 0);
+        assert!(!excluded.hard_link_duplicate);
+        assert_eq!(excluded.issue_count, 1);
+        let file = scan
+            .nodes
+            .iter()
+            .find(|n| n.name.as_ref() == OsStr::new("ordinary"))
+            .unwrap();
+        assert!(!file.hard_link_duplicate);
+        assert_eq!(
+            file.total_allocated_bytes,
+            fs::metadata(regular).unwrap().blocks() * 512
+        );
+        assert_eq!(scan.nodes[0].file_count, 1);
+        assert_eq!(scan.nodes[0].total_logical_bytes, 8192);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rejects_root_reached_through_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+        let temp = Temp::new();
+        fs::create_dir_all(temp.0.join("real/child")).unwrap();
+        symlink(temp.0.join("real"), temp.0.join("alias")).unwrap();
+        assert!(scan(&temp.0.join("alias/child"), &AtomicBool::new(false), |_| {}).is_err());
+        assert!(scan(
+            &temp.0.join("alias/../real"),
+            &AtomicBool::new(false),
+            |_| {}
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_normalizes_parent_components_after_no_follow_checks() {
+        let temp = Temp::new();
+        fs::create_dir(temp.0.join("child")).unwrap();
+        let result = scan(&temp.0.join("child/.."), &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(result.root_path, fs::canonicalize(&temp.0).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_dangling_link_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let temp = Temp::new();
+        symlink("missing-target", temp.0.join("dangling")).unwrap();
+        let scan = temp.scan();
+        assert_eq!(scan.nodes[0].file_count, 0);
+        assert_eq!(scan.nodes.len(), 2);
+        assert!(scan.nodes.iter().any(|node| node.kind == NodeKind::Symlink));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Requires Unix socket permission; run explicitly on normal Linux/CI hosts"]
+    fn linux_socket_is_not_opened_for_reading() {
+        use std::os::unix::net::UnixListener;
+        let temp = Temp::new();
+        let _listener = UnixListener::bind(temp.0.join("socket")).unwrap();
+        let scan = temp.scan();
+        assert_eq!(scan.nodes[0].file_count, 0);
+        assert_eq!(scan.nodes.len(), 2);
+        assert_eq!(scan.nodes[1].kind, NodeKind::Other);
     }
 
     #[test]
@@ -700,6 +875,7 @@ mod tests {
             OsStr::new("missing").into(),
             None,
             &mut HashSet::new(),
+            true,
         );
         let mut issues = Vec::new();
         let mut p = ScanProgress::default();
@@ -758,6 +934,7 @@ mod tests {
                     OsString::from_vec(name.to_vec()).into_boxed_os_str(),
                     None,
                     &mut HashSet::new(),
+                    true,
                 )
             })
             .collect();
@@ -983,6 +1160,7 @@ mod tests {
             OsString::from_wide(&units).into_boxed_os_str(),
             None,
             &mut HashSet::new(),
+            true,
         );
         let path = reconstruct_path(&[s.nodes[0].clone(), n], &t.0, 1);
         assert_eq!(

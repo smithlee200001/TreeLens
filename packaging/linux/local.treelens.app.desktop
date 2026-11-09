@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Tree Lens
+GenericName=Disk Usage Analyzer
+GenericName[zh_CN]=磁盘空间分析
+Comment=Explore folder sizes and allocated disk space
+Comment[zh_CN]=查看文件夹大小和实际磁盘占用
+Exec=tree-lens %f
+Icon=local.treelens.app
+Terminal=false
+Categories=System;Filesystem;
+Keywords=disk;storage;folders;space;
+StartupNotify=true
+StartupWMClass=local.treelens.app

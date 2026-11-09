@@ -1,5 +1,7 @@
 pub mod deletion;
 pub mod footprint;
+#[cfg(target_os = "linux")]
+mod linux_fs;
 pub mod platform;
 pub mod scanner;
 pub mod session;

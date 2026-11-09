@@ -1,7 +1,7 @@
 //! Folder-only, recoverable deletion. No permanent-delete fallback exists.
 //!
 //! Identity checks narrow the race between confirmation and moving to Trash, but
-//! NSFileManager and Windows Shell accept a pathname, not an open directory handle. Another process
+//! NSFileManager, Windows Shell and Linux GIO accept a pathname, not an open directory handle. Another process
 //! can still replace a component after the last check. This is not an atomic
 //! security boundary against a concurrently hostile filesystem.
 
@@ -87,6 +87,9 @@ impl DeletionRequest {
         if cursor != scan.root || names.is_empty() {
             return Err("文件夹不属于扫描根目录。".into());
         }
+        #[cfg(target_os = "linux")]
+        crate::linux_fs::validate_directory_ancestors(&scan.root_path)
+            .map_err(|error| format!("无法安全检查 Linux 文件夹路径：{error}"))?;
         #[cfg(windows)]
         validate_windows_ancestors(&scan.root_path)?;
         directory_identity(&scan.root_path)?;
@@ -128,6 +131,17 @@ impl DeletionRequest {
     }
 
     fn revalidate(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::linux_fs::validate_directory_ancestors(&self.original_root)
+                .and_then(|()| crate::linux_fs::validate_directory_ancestors(&self.path))
+                .map_err(|error| format!("无法安全检查 Linux 文件夹路径：{error}"))?;
+            let mounts = crate::linux_fs::MountTable::read()
+                .map_err(|error| format!("无法读取 Linux 挂载信息，已取消回收操作：{error}"))?;
+            if mounts.has_mount_at_or_below(&self.path) {
+                return Err("不能回收挂载点或包含挂载点的文件夹（包括 bind mount）。".into());
+            }
+        }
         #[cfg(windows)]
         {
             validate_windows_ancestors(&self.original_root)?;
@@ -176,9 +190,51 @@ fn move_to_trash(path: &Path) -> Result<(), String> {
         })
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn move_to_trash(_: &Path) -> Result<(), String> {
     Err("此平台不支持移到废纸篓或回收站；没有删除任何文件。".into())
+}
+
+/// GIO's trash operation implements the FreeDesktop Trash specification and
+/// returns an error when recycling is unavailable. Never use `gio remove`, `rm`,
+/// or `--force`, and never fall back to permanent deletion.
+#[cfg(target_os = "linux")]
+fn move_to_trash(path: &Path) -> Result<(), String> {
+    linux_trash_with(path, |path| {
+        std::process::Command::new("/usr/bin/gio")
+            .arg("trash")
+            .arg("--")
+            .arg(path)
+            .output()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_trash_with(
+    path: &Path,
+    run: impl FnOnce(&Path) -> std::io::Result<std::process::Output>,
+) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("回收操作需要绝对路径。".into());
+    }
+    let output = run(path).map_err(|error| {
+        format!("无法启动 /usr/bin/gio：{error}。请安装 libglib2.0-bin；未尝试永久删除。")
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "移到回收站失败：{}。未尝试永久删除。",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => {
+            Err("回收操作结束但原路径仍存在，无法确认成功；请重新扫描。未尝试永久删除。".into())
+        }
+        Err(error) => Err(format!(
+            "回收操作后无法确认原路径状态：{error}；请检查系统回收站并重新扫描。"
+        )),
+    }
 }
 
 #[cfg(all(test, any(unix, windows)))]
@@ -229,6 +285,120 @@ mod tests {
             .find(|node| node.name.as_ref() == std::ffi::OsStr::new(name))
             .unwrap()
             .id
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_backend_failure_missing_gio_and_false_success_are_errors() {
+        use std::os::unix::process::ExitStatusExt;
+        let fixture = Fixture::new();
+        let path = fixture.0.join("parent/child");
+        assert!(linux_trash_with(&path, |_| Err(std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )))
+        .unwrap_err()
+        .contains("libglib2.0-bin"));
+        for status in [0, 1 << 8] {
+            let result = linux_trash_with(&path, |received| {
+                assert_eq!(received, path);
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(status),
+                    stdout: Vec::new(),
+                    stderr: b"Trash unavailable".to_vec(),
+                })
+            });
+            assert!(result.is_err());
+            assert!(path.is_dir());
+        }
+        assert!(
+            linux_trash_with(Path::new("relative"), |_| panic!("must not invoke backend")).is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_backend_mock_move_verifies_source_disappearance() {
+        use std::os::unix::process::ExitStatusExt;
+        let fixture = Fixture::new();
+        let path = fixture.0.join("parent/child");
+        linux_trash_with(&path, |received| {
+            fs::rename(received, fixture.0.join("mock-trash"))?;
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        })
+        .unwrap();
+        assert!(fixture.0.join("mock-trash").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rejects_symlink_ancestor_above_scan_root() {
+        let fixture = Fixture::new();
+        let mut scan = fixture.scan();
+        let container = Fixture::new();
+        symlink(&fixture.0, container.0.join("alias")).unwrap();
+        scan.root_path = container.0.join("alias");
+        assert!(DeletionRequest::prepare(&scan, id(&scan, "child")).is_err());
+        assert!(
+            crate::linux_fs::validate_directory_ancestors(&container.0.join("alias/parent"))
+                .is_err()
+        );
+    }
+
+    /// Opt-in integration test: all source files, HOME and XDG Trash stay inside
+    /// one unique synthetic fixture. It never accesses the user's normal Trash.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires /usr/bin/gio; uses only an isolated synthetic HOME/Trash"]
+    fn linux_gio_round_trip_in_isolated_trash() {
+        let fixture = Fixture::new();
+        let data = fixture.0.join("data");
+        fs::create_dir(&data).unwrap();
+        let path = fixture.0.join("parent/child");
+        fs::write(path.join("payload"), b"synthetic recoverable content").unwrap();
+        let request = fixture.request();
+        request
+            .execute_with(|path| {
+                linux_trash_with(path, |path| {
+                    std::process::Command::new("/usr/bin/gio")
+                        .args(["trash", "--"])
+                        .arg(path)
+                        .env("HOME", &fixture.0)
+                        .env("XDG_DATA_HOME", &data)
+                        .env("GIO_USE_VFS", "local")
+                        .output()
+                })
+            })
+            .unwrap();
+        assert!(!path.exists());
+        let files: Vec<_> = fs::read_dir(data.join("Trash/files"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let infos: Vec<_> = fs::read_dir(data.join("Trash/info"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            fs::read(files[0].path().join("payload")).unwrap(),
+            b"synthetic recoverable content"
+        );
+        let info = fs::read_to_string(infos[0].path()).unwrap();
+        assert!(info.starts_with("[Trash Info]\n"));
+        assert!(info.contains("Path="));
+        assert!(info.contains("DeletionDate="));
+        // Restore only this fixture by a same-filesystem rename, then the fixture
+        // cleanup removes the now-unused metadata and its own synthetic files.
+        fs::rename(files[0].path(), &path).unwrap();
+        assert_eq!(
+            fs::read(path.join("payload")).unwrap(),
+            b"synthetic recoverable content"
+        );
     }
 
     #[test]
@@ -515,7 +685,7 @@ mod tests {
         assert!(fixture.0.join("parent/child").is_dir());
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
     #[test]
     fn unsupported_platform_keeps_folder() {
         let fixture = Fixture::new();

@@ -1,8 +1,11 @@
 pub mod deletion;
 pub mod footprint;
+pub mod platform;
 pub mod scanner;
 pub mod session;
 pub mod tree;
+#[cfg(windows)]
+mod windows_fs;
 
 /// Binary units: the app never labels powers of 1024 as decimal MB/GB.
 pub fn format_bytes(bytes: u64) -> String {

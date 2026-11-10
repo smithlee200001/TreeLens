@@ -96,6 +96,40 @@ fn progress_slot_keeps_only_latest_update() {
 }
 
 #[test]
+fn retained_progress_does_not_invalidate_view_but_completion_and_query_do() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session();
+    let slot: ProgressSlot = Arc::new(Mutex::new(None));
+    let (sender, receiver) = mpsc::sync_channel(1);
+    session.latest_progress = Some(Arc::clone(&slot));
+    session.receiver = Some(receiver);
+    session.reconciling = true;
+    let summary = session.summary();
+    let revision = session.revision();
+    for entries in 1..=20 {
+        *slot.lock().unwrap() = Some(ScanProgress {
+            entries,
+            ..ScanProgress::default()
+        });
+        assert!(
+            !session.poll(),
+            "hidden progress must not repaint retained text"
+        );
+        assert_eq!(session.progress.as_ref().unwrap().entries, entries);
+        assert_eq!(session.summary(), summary);
+        assert_eq!(session.revision(), revision);
+    }
+    session.set_query("missing".into());
+    let due = session.query_changed.unwrap() + QUERY_DEBOUNCE;
+    assert!(session.poll_at(due));
+    assert!(!session.poll_at(due));
+    sender.send(Ok(fixture.scan())).unwrap();
+    assert!(session.poll());
+    assert!(!session.busy());
+    assert_ne!(session.revision(), revision);
+}
+
+#[test]
 fn completion_indexes_result_and_search_updates_visible_rows() {
     let mut session = Session::new();
     let root = crate::features::scan::Node {

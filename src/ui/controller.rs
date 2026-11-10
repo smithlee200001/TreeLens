@@ -488,6 +488,11 @@ impl TreeLensApp {
                 .title(title.clone())
                 .w(px(600.0))
                 .centered()
+                // Keep unrelated text at the same brightness. The dialog's
+                // full-window input shield and focus trap remain active even
+                // without a painted backdrop; only the dim/slide fade is gone.
+                .entrance(gpui_kit::component::dialog::DialogEntrance::None)
+                .overlay(false)
                 .overlay_closable(false)
                 // Enter must not silently choose the destructive action.
                 .on_ok(|_, _, _| false)

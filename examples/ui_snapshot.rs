@@ -26,7 +26,7 @@ fn main() -> Result<()> {
         .next()
         .and_then(|s| s.to_str()?.parse::<f32>().ok())
         .unwrap_or(920.0);
-    let deletion_preview = args.next().is_some_and(|flag| flag == "--delete-dialog");
+    let preview = args.next();
     let mut cx = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
         Arc::new(gpui_kit::assets::Assets),
@@ -58,9 +58,36 @@ fn main() -> Result<()> {
         cx.advance_clock(Duration::from_millis(80));
         cx.run_until_parked();
     }
-    if deletion_preview {
+    if let Some(preview) = preview {
         cx.update_window(handle, |_, window, cx| {
-            view.update(cx, |app, cx| app.preview_delete_confirmation(window, cx));
+            view.update(cx, |app, cx| {
+                if preview == "--delete-dialog" {
+                    app.preview_delete_confirmation(window, cx);
+                } else if preview == "--file-trash-dialog" {
+                    app.preview_file_deletion(
+                        Some(tree_lens::deletion::DeletionMode::Trash),
+                        tree_lens::scanner::NodeKind::File,
+                        window,
+                        cx,
+                    );
+                } else if preview == "--file-permanent-dialog" {
+                    app.preview_file_deletion(
+                        Some(tree_lens::deletion::DeletionMode::Permanent),
+                        tree_lens::scanner::NodeKind::File,
+                        window,
+                        cx,
+                    );
+                } else if preview == "--folder-permanent-dialog" {
+                    app.preview_file_deletion(
+                        Some(tree_lens::deletion::DeletionMode::Permanent),
+                        tree_lens::scanner::NodeKind::Directory,
+                        window,
+                        cx,
+                    );
+                } else if preview == "--file-selected" {
+                    app.preview_file_deletion(None, tree_lens::scanner::NodeKind::File, window, cx);
+                }
+            });
         })?;
         cx.advance_clock(Duration::from_millis(300));
         cx.run_until_parked();

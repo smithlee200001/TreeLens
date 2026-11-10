@@ -38,7 +38,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>tree-lens</string>
   <key>CFBundleIdentifier</key><string>local.treelens.app</string>
   <key>CFBundleVersion</key><string>5</string>
-  <key>CFBundleShortVersionString</key><string>0.4.0</string>
+  <key>CFBundleShortVersionString</key><string>0.5.1</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSHighResolutionCapable</key><true/>

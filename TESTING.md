@@ -1,44 +1,43 @@
-# Tree Lens 0.5.0 Linux 验证记录
+# Tree Lens 0.5.1 文件与文件夹删除验证
 
-日期：2026-11-09。基线：[main 080f18a](https://github.com/smithlee200001/TreeLens/commit/080f18a9bbc08655f474011375328da68035cf2a)，已包含合并后的 Windows PR #1。此次没有推送 GitHub、触发远端 CI 或发布 release。
+日期：2026-11-10。基于 [GitHub main 7aca86e4](https://github.com/smithlee200001/TreeLens/commit/7aca86e4bbc90620486dbc17afc017c2941c7680)（0.5.0）。本记录涵盖发布前的源码验证；该阶段未推送远程、创建 PR、触发 GitHub CI、发布 release 或更改用户真实文件。后续 GitHub 发布和 CI 结果以对应 PR 记录为准。
 
-执行环境：Debian GNU/Linux 13 (trixie) x86_64 的受限开发容器，官方 Rust/Cargo 1.99.1。它不是完整 Debian 桌面，且不具有标准已安装系统库的 dpkg 所属关系/ABI 元数据。
+## 本次实现
+
+- 文件和文件夹都有「移到回收站 / 废纸篓…」和「彻底删除…」，在右键菜单与宽窗口详情栏可用。
+- 彻底删除使用独立的危险操作确认，显示完整路径，明确不可撤销、不会进入回收站；文件夹明确包含全部子文件与子文件夹。Enter 不默认确认，取消/Esc/关闭不删除。
+- 文件夹彻底删除先在后台采集内容快照，可用 Esc 取消准备。点击确认后复核全部子项，只按从子项到父目录的顺序删除已确认内容。内容变化、内部符号链接/重解析点、特殊文件、跨设备、挂载点和不可准确显示的名称会拒绝。
+- 回收失败绝不升级为彻底删除。根目录受保护，单次请求绑定操作类型，目标及祖先身份在执行前复核。
+- 成功后刷新统计、选择和地图。彻底删除中途失败时提示可能已部分删除，重新扫描，不自动重试。
 
 ## 已执行并通过
 
+环境：Debian 13 x86_64 受限开发容器，Rust/Cargo 1.99.1。GUI 使用工作区内的链接库引用、RUST_FONTCONFIG_DLOPEN=1 和软件图形驱动；没有安装系统软件或修改系统设置。
+
 - `cargo fmt --all -- --check`、`git diff --check`。
-- `cargo test --locked --no-default-features --all-targets`：55 项核心测试通过，2 项需显式启用的集成测试默认忽略。
-- `cargo test --locked --features ui-tests --all-targets`：55 项核心测试及 9 项 GPUI 交互测试通过。截图示例复用同组 9 项测试再执行一次，共 73 次通过，不计默认忽略的测试。
-- `cargo clippy --locked --features ui-tests --all-targets -- -D warnings`：完整 GUI/示例/测试严格检查通过。
-- 显式运行 `linux_gio_round_trip_in_isolated_trash`：1 项真实 `/usr/bin/gio` 回收测试通过。只操作唯一合成目录，子进程隔离 HOME/XDG_DATA_HOME，验证 Trash/files 内容和 .trashinfo，再用同文件系统 rename 恢复。没有操作正常用户回收站，也不代表桌面文件管理器的恢复 UI 已验收。
-- Linux 新测试覆盖 XDG 本地化/重定向/禁用目录和不执行 shell 的解析、挂载表转义/非 UTF-8/损坏输入、同设备目录及文件 bind mount 的模拟排除、硬链接归属不受跳过项目污染、符号链接上级拒绝、普通 `..` 路径规范化、悬空链接、不支持回收/缺少 GIO/假成功的错误处理。
-- 原有稀疏文件、硬链接、Unicode/非 UTF-8 路径、取消/部分结果、目录身份替换、删除确认单次消费、取消/Esc/Enter/重复确认、100,000 节点虚拟树测试继续通过。
-- `cargo clippy --locked --no-default-features --all-targets --target x86_64-pc-windows-msvc -- -D warnings`：Windows 核心跨目标类型检查通过。
-- `cargo check --locked --no-default-features --lib --target aarch64-apple-darwin`：macOS 核心及 Foundation 后端跨目标类型检查通过。以上两项均不是 Windows/macOS 原生链接或 GUI 执行。
-- 真实 GPUI 离屏渲染完成并检查最小尺寸界面/回收确认框；使用软件图形驱动及合成目录，预览后端不执行删除。
-- 全部 shell 脚本语法、桌面入口 desktop-file-validate、四发行版 workflow YAML、源码空白检查通过。
+- `cargo test --locked --no-default-features --all-targets`：70 项核心测试通过，3 项默认忽略。
+- `cargo test --locked --features ui-tests --all-targets`：70 项核心测试 + 17 项 GPUI 交互测试通过。截图示例还复用这 17 项 UI 测试，合计 104 次通过；不是 104 项独立测试。
+- `cargo test --locked --no-default-features --lib linux_gio_ -- --ignored`：文件和文件夹 2 项真实 GIO 回收往返测试通过。它们使用独立的合成 HOME/XDG Trash，验证内容和元数据并恢复，只操作自己的夹具。
+- `cargo clippy --locked --features ui-tests --all-targets -- -D warnings`。
+- `cargo check --locked --no-default-features --tests --target x86_64-pc-windows-msvc`：Windows 核心及测试跨目标类型检查。
+- `cargo check --locked --no-default-features --tests --target aarch64-apple-darwin`：macOS 核心、Foundation 后端及测试跨目标类型检查。
+- shell 打包脚本语法检查。
+- 真实 GPUI 离屏渲染并人工检查了宽窗口双按钮、文件回收确认、文件彻底删除确认、1080×760 逻辑尺寸下的文件夹彻底删除确认。截图见 docs/preview-file-*.png 和 docs/preview-folder-permanent.png；不是原生 macOS/Windows 桌面截图。
 
-本地 GUI 构建利用现有运行库，在工作区创建链接器所需的库链接，并设置 `RUST_FONTCONFIG_DLOPEN=1`。没有系统安装、提权或修改系统设置。常规发行版构建应安装 scripts/install-linux-deps.sh 列出的官方开发依赖；CI 不采用上述工作区兼容方式。
+测试覆盖：普通文件/嵌套文件夹/空文件夹/Unicode、硬链接不误删其他路径、根目录/失效节点/畸形父链、目标与祖先替换、类型变化、内部链接/挂载点、确认后新增/删除/编辑子项、无快照拒绝执行、后台准备取消、Enter/取消/Esc/关闭、模式不可被第二次点击替换、重复确认、删除后刷新，以及模拟部分失败后的刷新和不重试。
 
-## 构建和打包
+## 未执行，不代表通过
 
-- 完整 x86_64 GNU/Linux 优化 release GUI 已构建，使用锁文件、thin LTO 和项目原有 release 配置。
-- `bash scripts/bundle-linux.sh --tar-only` 已生成 Debian 13 amd64 开发 tar.gz，解包后的 `--version` / `--help`、动态库解析和 SHA-256 校验通过。包含桌面入口、图标、许可证及实际 ELF 依赖信息；它不是跨发行版通用包。
-- `.deb` 默认使用 dpkg-shlibdeps 从实际 ELF 生成最低 ABI 依赖。在本容器缺少标准 dpkg 元数据时明确失败，不编造最低依赖版本。不能据此宣称 `.deb` 已验收。
-- 包脚本的 `.deb`/tar 结构、root 所有权、桌面入口和校验和已通过合成 ELF 测试。合成测试产物不作为 Tree Lens 可运行程序交付。
+- 本版本在真实 Windows/macOS 的 GUI、回收站成功/失败/恢复、签名及发布构建。跨目标检查不是原生链接或执行；Windows 新增的内部 junction 拒绝测试需原生 CI 执行。
+- Debian 12/Ubuntu 22.04/24.04 的本版本原生运行。现有 Linux CI 矩阵已更新为运行文件及文件夹 GIO 测试，但未远程触发。
+- 真实桌面 X11/Wayland、不同 DPI、完整目录选择器、可移动/网络磁盘、回收站满/禁用、真实权限失败与真实挂载操作。挂载保护通过合成挂载表验证。
+- 默认忽略的 Unix socket 权限测试本次没有执行。
+- 没有生成本版本原生安装包；本次交付是可构建源码及验证记录。
 
-## 尚未执行，不代表通过
+## 安全与性能边界
 
-- Debian 12、Ubuntu 22.04/24.04 原生构建、测试和安装。已加入官方发行版容器 CI 矩阵，但此次没有远端执行。
-- 真实桌面 X11/Wayland 窗口、不同缩放、拖放、目录选择门户取消/重开、文件管理器集成和桌面恢复 UI。
-- 真实 bind mount/跨设备/可移动盘、只读盘、回收站满/不可用、网络文件系统与桌面权限失败路径。挂载排除使用合成 mountinfo 测试，没有执行挂载操作。
-- `linux_socket_is_not_opened_for_reading` 在本受限运行环境尝试建立 Unix socket 时被拒绝（EPERM）。该测试保留为显式启用，已配置在普通 Linux CI 容器运行，本地不声称通过。
-- ARM64 Linux、32 位、非 glibc 发行版、完整 Windows/macOS 本版本桌面回归、签名及正式分发。
+最终删除仍是路径接口。检查与实际操作之间有并发替换窗口，不能宣称对恶意并发文件系统修改具备原子安全保证。确认后请勿并行移动或重命名目标或祖先目录。递归删除可能因权限、设备变化或并发修改中途失败，已经删除的内容不可撤销。
 
-## 安全边界
+永久删除文件夹对内部链接采取保守拒绝策略，不跟随链接、不自动转为其他删除方式。macOS 符号链接别名路径需改用真实路径。Windows 删除只支持本地固定磁盘。大型文件夹的全部内容检查与逐项保护会增加耗时和内存占用；准备过程在后台并可取消。
 
-扫描只读取元数据，使用 `st_blocks × 512` 和 `(device, inode)` 硬链接去重。Linux 挂载表在扫描开始时读取，扫描和回收均不是原子文件系统快照。Btrfs/ZFS 的共享块、压缩、快照、预留空间不能精确归属；统计不是可释放空间。
-
-Linux 回收只在明确确认后调用固定 `/usr/bin/gio trash -- <path>`。执行前重新读取挂载表并检查目标/上级身份，拒绝符号链接、挂载点及包含挂载点的目录，无永久删除回退。路径检查与 GIO/桌面 API 使用路径之间仍存在并发替换窗口，不是对抗恶意并发修改的安全边界。
-
-历史验证记录见 [TESTING-v0.4.md](TESTING-v0.4.md) 和更早记录。
+彻底删除不是安全擦除，其他硬链接、快照、备份或底层磁盘恢复不在本应用控制范围内。历史 0.5.0 验证记录保留在 [TESTING-v0.5.md](TESTING-v0.5.md)。

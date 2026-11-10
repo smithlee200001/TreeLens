@@ -434,6 +434,7 @@ fn file_inspector_buttons_cancel_enter_and_mode_are_safe(cx: &mut TestAppContext
     let (temp, handle, view, id) = file_fixture(cx, 1440.0);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
+        scroll_inspector_to("delete-permanent-selected", window, cx);
         assert!(window.find("delete-selected").visible());
         assert!(window.find("delete-permanent-selected").visible());
         assert!(window.find("delete-permanent-selected").bounds().bottom() < px(760.0));
@@ -637,6 +638,7 @@ fn folder_permanent_warning_cancel_and_recursive_confirmation(cx: &mut TestAppCo
             cx.notify();
         });
         window.render_frame(cx);
+        scroll_inspector_to("delete-permanent-selected", window, cx);
         assert!(window.find("delete-permanent-selected").visible());
         window.click("delete-permanent-selected", cx);
         wait_for_deletion_preparation(&view, window, cx);
@@ -672,6 +674,30 @@ fn folder_permanent_warning_cancel_and_recursive_confirmation(cx: &mut TestAppCo
     .unwrap();
     assert!(!temp.0.join("scan/folder-to-trash").exists());
     assert!(temp.0.join("scan").is_dir());
+}
+
+fn scroll_inspector_to(id: &'static str, window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
+    // Natural-height details may need scrolling; never make buttons fit by
+    // vertically crushing the name/path as the previous layout did.
+    for _ in 0..60 {
+        window.render_frame(cx);
+        let viewport = window.find("inspector-scroll").bounds();
+        let target = window.find(id).bounds();
+        if target.top() >= viewport.top() && target.bottom() <= viewport.bottom() {
+            return;
+        }
+        let delta = if target.bottom() > viewport.bottom() {
+            -48.0
+        } else {
+            48.0
+        };
+        window.scroll(
+            "inspector-scroll",
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(delta))),
+            cx,
+        );
+    }
+    panic!("inspector control {id} is not reachable");
 }
 fn wait_for_deletion_preparation(
     view: &Entity<TreeLensApp>,

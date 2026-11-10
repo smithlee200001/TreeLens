@@ -195,6 +195,8 @@ impl Session {
     }
 
     /// Drain the latest progress and a possible result, then apply due search.
+    /// Returns whether the displayed state changed. Progress behind a retained
+    /// result is consumed but does not invalidate that unchanged view.
     /// Idle polls do not rebuild or sort the tree.
     pub fn poll(&mut self) -> bool {
         self.poll_at(Instant::now())
@@ -206,7 +208,7 @@ impl Session {
             if let Ok(mut slot) = latest.lock() {
                 if let Some(progress) = slot.take() {
                     self.progress = Some(progress);
-                    changed = true;
+                    changed = self.result.is_none();
                 }
             }
         }

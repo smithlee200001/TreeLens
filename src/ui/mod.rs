@@ -2,6 +2,10 @@
 //! Feature state lives in `features`; OS integrations live in `platform`.
 mod controller;
 #[cfg(all(test, feature = "ui-tests"))]
+mod flicker_tests;
+#[cfg(all(test, feature = "ui-tests"))]
+mod inspector_tests;
+#[cfg(all(test, feature = "ui-tests"))]
 mod tests;
 mod theme;
 
@@ -22,6 +26,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
+    scroll::ScrollableElement,
     spinner::Spinner,
     tooltip::Tooltip,
     Disableable, Icon, IconName, Sizable, TitleBar, WindowExt,
@@ -135,6 +140,9 @@ impl TreeLensApp {
                     .label(label)
                     .icon(IconName::Folder)
                     .disabled(busy)
+                    // Busy still disables actions, but does not pulse text
+                    // throughout the otherwise unchanged navigation panel.
+                    .text_color(rgb(TEXT))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(path) = platform::shortcut_path(suffix) {
                             this.start(path, window, cx);
@@ -277,6 +285,12 @@ impl TreeLensApp {
                             .icon(IconName::FolderOpen)
                             .label("选择文件夹")
                             .disabled(busy || self.choosing)
+                            .when(busy || self.choosing, |button| {
+                                button
+                                    .text_color(rgb(0x092322))
+                                    .bg(rgb(CYAN))
+                                    .border_color(rgb(CYAN))
+                            })
                             .tooltip(desktop::OPEN_TOOLTIP)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.choose_folder(window, cx)),
@@ -285,7 +299,9 @@ impl TreeLensApp {
                     .child(
                         div().flex_1().min_w_0().child(
                             Input::new(&self.path_input)
-                                .disabled(busy)
+                                // Read-only keeps path text/copying stable;
+                                // start() still rejects Enter while busy.
+                                .readonly(busy)
                                 .aria_label("扫描文件夹路径"),
                         ),
                     )
@@ -293,6 +309,7 @@ impl TreeLensApp {
                         Button::new("scan-path")
                             .label("扫描")
                             .disabled(busy)
+                            .when(busy, stable_navigation_button)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let path = this.path_input.read(cx).value().to_string();
                                 if !path.trim().is_empty() {
@@ -302,6 +319,7 @@ impl TreeLensApp {
                     )
                     .child(if self.session.busy() {
                         Button::new("cancel")
+                            .w(px(80.0))
                             .label(if self.session.cancelling() {
                                 "取消中…"
                             } else {
@@ -314,9 +332,11 @@ impl TreeLensApp {
                             }))
                     } else {
                         Button::new("refresh")
+                            .w(px(80.0))
                             .icon(IconName::RotateCw)
                             .tooltip(desktop::REFRESH_TOOLTIP)
                             .disabled(busy || self.session.root_path.is_none())
+                            .when(busy, stable_navigation_button)
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx)))
                     }),
             )
@@ -464,7 +484,7 @@ impl TreeLensApp {
                     .justify_center()
                     .text_sm()
                     .text_color(rgb(MUTED))
-                    .child(if self.session.busy() {
+                    .child(if self.session.busy() && self.session.result.is_none() {
                         "正在绘制你的空间地图…"
                     } else if self.session.result.is_some() {
                         "此目录暂无已分配空间"
@@ -958,8 +978,10 @@ impl TreeLensApp {
 
     fn inspector(&self, cx: &mut Context<Self>) -> Div {
         let generation = self.generation;
-        let mut panel = div()
+        let panel = div()
             .w(px(220.0))
+            .min_h_0()
+            .overflow_hidden()
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -971,13 +993,27 @@ impl TreeLensApp {
             .bg(rgb(PANEL))
             .child(
                 div()
+                    .id("inspector-heading")
+                    .test_support()
+                    .flex_shrink_0()
                     .text_size(px(10.0))
                     .text_color(rgb(MUTED))
                     .child("INSPECTOR / 项目详情"),
             );
+        // Only this viewport shrinks. Its single natural-height content column
+        // keeps text and actions intact even in a short window.
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_full()
+            .min_w_0()
+            .gap_3();
         if let Some((scan, id)) = self.session.result.as_ref().zip(self.session.selected) {
             let node = &scan.nodes[id];
-            panel = panel
+            let name = node.display_name().into_owned();
+            let path = scan.path_for(id).display().to_string();
+            body = body
                 .child(
                     Icon::new(if node.kind == NodeKind::Directory {
                         IconName::FolderOpen
@@ -989,9 +1025,16 @@ impl TreeLensApp {
                 )
                 .child(
                     div()
+                        .id("inspector-name")
+                        .test_support()
+                        .w_full()
+                        .min_w_0()
+                        .flex_shrink_0()
                         .text_lg()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .truncate()
+                        .whitespace_normal()
+                        .aria_label(name.clone())
+                        .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
                         .child(node.display_name().into_owned()),
                 )
                 .child(
@@ -1019,8 +1062,15 @@ impl TreeLensApp {
                 )
                 .child(
                     div()
+                        .id("inspector-path")
+                        .test_support()
+                        .w_full()
+                        .min_w_0()
+                        .flex_shrink_0()
                         .text_xs()
-                        .overflow_hidden()
+                        .whitespace_normal()
+                        .aria_label(path.clone())
+                        .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
                         .child(scan.path_for(id).display().to_string()),
                 )
                 .when(node.hard_link_duplicate, |panel| {
@@ -1091,19 +1141,32 @@ impl TreeLensApp {
                     )
                 });
         } else {
-            panel = panel.child(
+            body = body.child(
                 div()
                     .text_sm()
                     .text_color(rgb(MUTED))
                     .child("选择文件树中的项目，在这里查看详细信息。"),
             );
         }
-        panel.child(div().flex_1()).child(
-            div()
-                .text_size(px(10.0))
-                .text_color(rgb(MUTED))
-                .child(platform::STORAGE_CAVEAT),
-        )
+        panel
+            .child(
+                div()
+                    .id("inspector-scroll")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(div().size_full().child(body).overflow_y_scrollbar()),
+            )
+            .child(
+                div()
+                    .id("inspector-caveat")
+                    .test_support()
+                    .flex_shrink_0()
+                    .text_size(px(10.0))
+                    .text_color(rgb(MUTED))
+                    .child(platform::STORAGE_CAVEAT),
+            )
     }
 
     fn status_bar(&self, cx: &mut Context<Self>) -> Div {
@@ -1153,18 +1216,36 @@ impl TreeLensApp {
             .border_t_1()
             .border_color(rgb(BORDER))
             .bg(rgb(0x0c131c))
-            .child(if self.busy() {
-                Spinner::new()
-                    .xsmall()
-                    .color(rgb(CYAN).into())
-                    .into_any_element()
-            } else {
+            // A spinner inside this view requests a full TreeLensApp render
+            // every animation frame. Retained work only needs its status text
+            // and a static indicator, not repeated redraws of unchanged glyphs.
+            .child(
                 div()
-                    .size(px(6.0))
-                    .rounded_full()
-                    .bg(rgb(if self.session.partial() { AMBER } else { CYAN }))
-                    .into_any_element()
-            })
+                    .id("status-indicator")
+                    .test_support()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if self.busy() && self.session.result.is_none() {
+                        Spinner::new()
+                            .xsmall()
+                            .color(rgb(CYAN).into())
+                            .into_any_element()
+                    } else {
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(rgb(if self.busy() || self.session.partial() {
+                                AMBER
+                            } else {
+                                CYAN
+                            }))
+                            .into_any_element()
+                    }),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1178,6 +1259,7 @@ impl TreeLensApp {
                 el.child(
                     Button::new("issues")
                         .disabled(self.deletion.is_some() || self.preparing_deletion.is_some())
+                        .text_color(rgb(TEXT))
                         .ghost()
                         .xsmall()
                         .label(format!("{issue_count} 处问题"))
@@ -1189,6 +1271,7 @@ impl TreeLensApp {
             .child(
                 Button::new("about")
                     .disabled(self.deletion.is_some() || self.preparing_deletion.is_some())
+                    .text_color(rgb(TEXT))
                     .ghost()
                     .xsmall()
                     .label("统计说明")
@@ -1347,6 +1430,15 @@ impl Render for TreeLensApp {
             )
             .child(self.status_bar(cx))
     }
+}
+
+/// Keep short-lived navigation locks semantically disabled without changing
+/// their idle colors. The status bar explains why actions are temporarily held.
+fn stable_navigation_button(button: Button) -> Button {
+    button
+        .text_color(rgb(TEXT))
+        .bg(rgb(0x1a2634))
+        .border_color(rgb(0x0c141e))
 }
 
 fn detail(label: &'static str, value: String) -> Div {

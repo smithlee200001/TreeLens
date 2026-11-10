@@ -30,7 +30,10 @@ impl Fixture {
         for index in 0..40 {
             std::fs::write(root.join(format!("filler-{index:02}.txt")), b"fixture only").unwrap();
         }
-        Self(root)
+        // macOS temp_dir can begin with /var, an alias of /private/var.
+        // Use the physical fixture path, as the deletion safety tests do, so
+        // the real symlink-ancestor guard is not bypassed or tripped by setup.
+        Self(std::fs::canonicalize(root).unwrap())
     }
 }
 impl Drop for Fixture {
@@ -113,7 +116,11 @@ fn lifecycle(
         app.request_delete_mode(id, DeletionMode::Permanent, window, cx)
     });
     window.render_frame(cx);
-    assert!(window.has_active_dialog(cx));
+    assert!(
+        window.has_active_dialog(cx),
+        "confirmation did not open: {}",
+        view.read(cx).session.status
+    );
     assert!(window.find("delete-confirm").visible());
     capture("open", window, cx);
     // A transparent overlay must still block pointer dispatch to background controls.

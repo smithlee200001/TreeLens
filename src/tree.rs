@@ -210,6 +210,25 @@ impl VisibleTree {
         Some((id, depth))
     }
 
+    /// Locate one visible node without allocating a flattened row list. This is
+    /// the inverse of `row_at`, used to keep the viewport anchored after updates.
+    pub fn row_index(&self, scan: &ScanOutcome, mut id: NodeId) -> Option<usize> {
+        if self.is_empty() || id >= scan.nodes.len() || !self.matches(id) {
+            return None;
+        }
+        let mut row = 0;
+        while id != scan.root {
+            let parent = scan.nodes[id].parent?;
+            let branch = self.branches.get(&parent)?;
+            let node = &scan.nodes[parent];
+            let position = (0..branch.children_len(node))
+                .find(|&position| branch.child_at(node, position) == id)?;
+            row += 1 + branch.child_start(position);
+            id = parent;
+        }
+        Some(row)
+    }
+
     /// Allocates only the requested viewport, typically a few dozen rows.
     pub fn rows(&self, scan: &ScanOutcome, range: Range<usize>) -> Vec<(NodeId, usize)> {
         (range.start.min(self.total_rows)..range.end.min(self.total_rows))
@@ -338,6 +357,34 @@ mod tests {
                 );
             }
             assert_eq!(tree.row_at(&scan, tree.len()), None);
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn row_index_is_inverse_for_sort_filter_and_collapsed_branches() {
+        let (path, mut scan) = fixture();
+        let expanded = scan.nodes.iter().map(|node| node.id).collect();
+        let mut tree = VisibleTree::new();
+        for sort in [
+            SortBy::Name,
+            SortBy::Logical,
+            SortBy::Allocated,
+            SortBy::Files,
+        ] {
+            sort_tree(&mut scan, sort);
+            for query in ["", "needle", "deep", "missing"] {
+                for open in [&expanded, &HashSet::from([scan.root])] {
+                    tree.rebuild(&scan, open, query);
+                    for node in &scan.nodes {
+                        let expected = (0..tree.len()).find(|&index| {
+                            tree.row_at(&scan, index).map(|row| row.0) == Some(node.id)
+                        });
+                        assert_eq!(tree.row_index(&scan, node.id), expected);
+                    }
+                    assert_eq!(tree.row_index(&scan, usize::MAX), None);
+                }
+            }
         }
         fs::remove_dir_all(path).unwrap();
     }

@@ -7265,7 +7265,7 @@ dependencies = [
 
 [[package]]
 name = "tree-lens"
-version = "0.5.1"
+version = "0.5.3"
 dependencies = [
  "gpui-kit",
  "objc2-foundation 0.3.2",

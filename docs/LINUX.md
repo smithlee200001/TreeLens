@@ -48,7 +48,7 @@ is unique and retained for inspection.
 Install the `.deb` built for **your distro release and architecture**:
 
 ```sh
-sudo apt install ./dist/Tree-Lens-0.5.0-ubuntu-24.04-amd64.deb
+sudo apt install ./dist/Tree-Lens-0.5.1-ubuntu-24.04-amd64.deb
 ```
 
 Adjust the filename to the actual artifact. Launch **Tree Lens** from the desktop
@@ -96,7 +96,7 @@ No root access or package installation is needed to create it.
   by device/inode. Symlinks are not followed. CoW/reflinks, snapshots, compression
   and filesystems reporting unusual block allocation mean this is not an exact
   prediction of recoverable free space.
-- Moving a folder to Trash requires the application's explicit confirmation and
+- Moving a file or folder to Trash requires the application's explicit confirmation and
   path/identity revalidation. The Linux backend uses `/usr/bin/gio trash`, which
   delegates FreeDesktop Trash handling to GIO (`libglib2.0-bin`). There is no
   fallback to permanent deletion. Failures such as missing GIO, unsupported
@@ -104,7 +104,13 @@ No root access or package installation is needed to create it.
 - Restore through the desktop file manager's Trash. The application does not
   restore files. Avoid running it as root: that uses a different home/Trash and
   can reach system files. Do not use a production folder for acceptance tests.
-- Path checks cannot make pathname-based Trash operations atomic against another
+- Permanent deletion is a separate, explicitly confirmed action for files and folders.
+  Folders are snapshotted in the background and revalidated before bottom-up deletion.
+  Links, special files and mounts inside a permanent-delete subtree are rejected.
+  Execution errors may leave a partially deleted tree, followed by a rescan.
+  It never calls Trash and is not secure erasure.
+  Other hard links remain.
+- Path checks cannot make pathname-based Trash or permanent operations atomic against another
   process concurrently replacing paths. Treat the filesystem as non-hostile.
 
 ## Verification and remaining desktop acceptance
@@ -114,7 +120,7 @@ userspaces in separate containers. It runs core tests, headless GPUI interaction
 tests, strict Clippy, release builds, desktop-entry validation, package extraction,
 ELF dependency checks and package installation, then runs the installed binary's
 `--version` and `--help` without opening a graphical window and uploads distinct
-artifacts. CI also explicitly opts into the isolated real GIO Trash round-trip
+artifacts. CI also explicitly opts into the isolated real GIO file and folder Trash round-trips
 and Unix socket scan tests; the GIO fixture uses its own HOME and XDG data
 directory, never the user's normal Trash.
 Containers share the runner kernel and are not complete desktop VMs. No real

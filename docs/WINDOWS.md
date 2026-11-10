@@ -75,6 +75,6 @@ GPUI 已默认提供含 `asInvoker`、Windows 10 兼容声明及 PerMonitorV2 DP
 
 ### 回收站失败路径的发布前验收
 
-回收后端申请 `FOFX_RECYCLEONDELETE`，并在 `PreDeleteItem` 中拒绝未带 `TSF_DELETE_RECYCLE_IF_POSSIBLE` 的操作。它检查 `PerformOperations`、取消状态和每项完成结果，不调用永久删除 API。**当前只验证了回调逻辑与类型，尚未通过真实 Windows Shell 的失败路径验收。**
+回收后端申请 `FOFX_RECYCLEONDELETE`，并在 `PreDeleteItem` 中拒绝未带 `TSF_DELETE_RECYCLE_IF_POSSIBLE` 的操作。它检查 `PerformOperations`、取消状态和每项完成结果，此回收路径不调用永久删除 API。另行选择并明确确认的「彻底删除」支持文件和文件夹，使用文件/空目录删除 API，不进入回收站。文件夹先在后台记录全部内容，确认后再次复核，再逐项从子项到父目录删除；不跟随内部链接或重解析点，不跨卷。执行失败可能留下部分删除结果，此时显示警告并刷新。彻底删除不是安全擦除。**当前只验证了回调逻辑与类型，尚未通过真实 Windows Shell 的失败路径验收。**
 
 在隔离的测试账户或测试虚拟机中，使用可丢弃的小夹具覆盖回收站禁用、容量不足/超出容量、权限拒绝、文件占用、系统取消；必须确认原内容仍在且没有静默永久删除。不要为了测试修改用户正在使用的回收站设置。不要把 `PostDeleteItem` 的事后结果检查当成永久删除的预防证明。正式发布前记录系统版本和实际结果。

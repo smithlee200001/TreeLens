@@ -45,7 +45,7 @@ jobs:
       - name: Core filesystem and deletion regression tests
         run: cargo test --locked --no-default-features --lib
       - name: Isolated GIO Trash round-trip
-        run: cargo test --locked --no-default-features --lib linux_gio_round_trip_in_isolated_trash -- --ignored
+        run: cargo test --locked --no-default-features --lib linux_gio_ -- --ignored
       - name: Linux socket scan regression
         run: cargo test --locked --no-default-features --lib linux_socket_is_not_opened_for_reading -- --ignored
       - name: Core and headless GPUI interaction tests

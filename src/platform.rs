@@ -17,9 +17,9 @@ pub const REVEAL_LABEL: &str = if cfg!(windows) {
     }
 };
 pub const DELETE_LABEL: &str = if cfg!(any(windows, target_os = "linux")) {
-    "删除文件夹…（移到回收站）"
+    "移到回收站…"
 } else {
-    "删除文件夹…（移到废纸篓）"
+    "移到废纸篓…"
 };
 pub const SHORTCUT_HELP: &str = if cfg!(target_os = "macos") {
     "快捷键：⌘O 选择文件夹 · ⌘R 刷新 · ⌘F 筛选 · Esc 关闭说明或取消扫描。"

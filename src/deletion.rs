@@ -1,25 +1,28 @@
-//! Folder-only, recoverable deletion. No permanent-delete fallback exists.
+//! Recoverable file/folder deletion and explicitly confirmed permanent deletion.
+//! Trash failures never fall back to permanent deletion.
 //!
-//! Identity checks narrow the race between confirmation and moving to Trash, but
-//! NSFileManager, Windows Shell and Linux GIO accept a pathname, not an open directory handle. Another process
+//! Identity checks narrow the race between confirmation and deletion, but
+//! native Trash APIs and remove_file accept a pathname, not a bound identity. Another process
 //! can still replace a component after the last check. This is not an atomic
 //! security boundary against a concurrently hostile filesystem.
 
 use crate::scanner::{NodeId, NodeKind, ScanOutcome};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Identity {
     device: u64,
     inode: u128,
+    directory: bool,
 }
 
-fn directory_identity(path: &Path) -> Result<Identity, String> {
+fn entry_identity(path: &Path) -> Result<Identity, String> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("无法检查文件夹 {}：{error}", path.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err("目标或上级路径不是普通文件夹，请重新扫描。".into());
+        .map_err(|error| format!("无法检查项目 {}：{error}", path.display()))?;
+    if !(metadata.is_dir() || metadata.is_file()) || metadata.file_type().is_symlink() {
+        return Err("目标不是普通文件或文件夹，请重新扫描。".into());
     }
     #[cfg(unix)]
     {
@@ -27,22 +30,134 @@ fn directory_identity(path: &Path) -> Result<Identity, String> {
         Ok(Identity {
             device: metadata.dev(),
             inode: metadata.ino() as u128,
+            directory: metadata.is_dir(),
         })
     }
     #[cfg(windows)]
     {
-        let entry = crate::windows_fs::query(path)
-            .map_err(|error| format!("无法检查文件夹身份：{error}"))?;
-        if !entry.directory || entry.reparse {
+        let entry =
+            crate::windows_fs::query(path).map_err(|error| format!("无法检查项目身份：{error}"))?;
+        if entry.reparse || entry.directory != metadata.is_dir() {
             return Err("不能删除重解析点、符号链接或联接目录。".into());
         }
         Ok(Identity {
             device: entry.volume,
             inode: entry.id,
+            directory: entry.directory,
         })
     }
     #[cfg(not(any(unix, windows)))]
-    Err("此平台不支持安全的文件夹身份检查。".into())
+    Err("此平台不支持安全的项目身份检查。".into())
+}
+
+fn directory_identity(path: &Path) -> Result<Identity, String> {
+    let identity = entry_identity(path)?;
+    if !identity.directory {
+        return Err("上级路径不是普通文件夹，请重新扫描。".into());
+    }
+    Ok(identity)
+}
+
+/// The confirmation binds the selected action; Trash never escalates to Permanent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionMode {
+    Trash,
+    Permanent,
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_ancestors(path: &Path) -> Result<(), String> {
+    let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                current.pop();
+            }
+            Component::CurDir => continue,
+            component => current.push(component.as_os_str()),
+        }
+        directory_identity(&current)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SubtreeEntry {
+    identity: Identity,
+    // In-place edits should invalidate confirmation too. Directory mtimes are
+    // excluded because our own bottom-up removals change them.
+    file_state: Option<(u64, std::time::SystemTime)>,
+}
+
+type Subtree = std::collections::BTreeMap<PathBuf, SubtreeEntry>;
+
+fn subtree_entry(path: &Path) -> Result<SubtreeEntry, String> {
+    let identity = entry_identity(path)?;
+    let file_state = if identity.directory {
+        None
+    } else {
+        let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        Some((
+            metadata.len(),
+            metadata.modified().map_err(|e| e.to_string())?,
+        ))
+    };
+    Ok(SubtreeEntry {
+        identity,
+        file_state,
+    })
+}
+
+/// Snapshot without following links. Every directory is checked again before
+/// enumeration; this is conservative validation, not an atomic filesystem lock.
+fn snapshot_subtree(root: &Path, device: u64, cancelled: &AtomicBool) -> Result<Subtree, String> {
+    #[cfg(target_os = "linux")]
+    reject_linux_subtree_mounts(
+        root,
+        &crate::linux_fs::MountTable::read().map_err(|e| e.to_string())?,
+    )?;
+    let mut result = Subtree::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("已取消内容检查；没有删除任何项目。".into());
+        }
+        for ancestor in path.ancestors().skip(1).take_while(|p| p.starts_with(root)) {
+            let expected: &SubtreeEntry = result.get(ancestor).ok_or("目录结构已改变。")?;
+            if directory_identity(ancestor)? != expected.identity {
+                return Err("上级目录已改变，请重新扫描。".into());
+            }
+        }
+        #[cfg(windows)]
+        validate_windows_ancestors(&path)?;
+        let entry = subtree_entry(&path)?;
+        if entry.identity.device != device || path.to_str().is_none() {
+            return Err("子目录包含跨磁盘项目或无法准确显示的名称，已取消删除。".into());
+        }
+        if entry.identity.directory {
+            for child in fs::read_dir(&path).map_err(|e| format!("无法检查全部子项目：{e}"))?
+            {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err("已取消内容检查；没有删除任何项目。".into());
+                }
+                pending.push(child.map_err(|e| e.to_string())?.path());
+            }
+        }
+        result.insert(path, entry);
+    }
+    Ok(result)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_linux_subtree_mounts(
+    path: &Path,
+    mounts: &crate::linux_fs::MountTable,
+) -> Result<(), String> {
+    if mounts.has_mount_at_or_below(path) {
+        return Err("不能删除挂载点或包含挂载点的项目（包括 bind mount）。".into());
+    }
+    Ok(())
 }
 
 /// A single-use confirmation snapshot. Construct when opening the confirmation
@@ -53,17 +168,42 @@ pub struct DeletionRequest {
     root: PathBuf,
     path: PathBuf,
     identities: Vec<(PathBuf, Identity)>,
+    mode: DeletionMode,
+    subtree: Option<Subtree>,
 }
 
 impl DeletionRequest {
     pub fn prepare(scan: &ScanOutcome, id: NodeId) -> Result<Self, String> {
+        Self::prepare_with_mode(scan, id, DeletionMode::Trash)
+    }
+
+    pub fn prepare_with_mode(
+        scan: &ScanOutcome,
+        id: NodeId,
+        mode: DeletionMode,
+    ) -> Result<Self, String> {
+        Self::prepare_target_with_mode(scan, id, mode)?.snapshot_contents()
+    }
+
+    /// Fast target-only validation; recursive capture must run off the UI thread.
+    pub fn prepare_target_with_mode(
+        scan: &ScanOutcome,
+        id: NodeId,
+        mode: DeletionMode,
+    ) -> Result<Self, String> {
+        if scan.nodes.get(scan.root).is_none_or(|root| {
+            root.kind != NodeKind::Directory || root.parent.is_some() || root.id != scan.root
+        }) {
+            return Err("扫描根目录数据已失效。".into());
+        }
         if id == scan.root {
             return Err("不能删除本次扫描的根目录。".into());
         }
         let node = scan.nodes.get(id).ok_or("所选项目已失效，请重新扫描。")?;
-        if node.kind != NodeKind::Directory {
-            return Err("只能将普通文件夹移到废纸篓。".into());
+        if !matches!(node.kind, NodeKind::Directory | NodeKind::File) {
+            return Err("只能删除普通文件或文件夹。".into());
         }
+        let target_directory = node.kind == NodeKind::Directory;
         // Do not use path_for on unchecked parent links: stale/malformed input
         // must fail rather than panic, loop, or escape the root via a filename.
         let mut names = Vec::new();
@@ -77,16 +217,28 @@ impl DeletionRequest {
             let mut components = name.components();
             if !matches!(components.next(), Some(Component::Normal(_)))
                 || components.next().is_some()
-                || node.kind != NodeKind::Directory
+                || node.id != cursor
+                || (cursor != id && node.kind != NodeKind::Directory)
             {
                 return Err("文件夹路径不安全，请重新扫描。".into());
             }
             names.push(node.name.as_ref());
-            cursor = node.parent.ok_or("文件夹不属于扫描根目录。")?;
+            let parent = node.parent.ok_or("项目不属于扫描根目录。")?;
+            if scan
+                .nodes
+                .get(parent)
+                .is_none_or(|parent_node| !parent_node.children.contains(&cursor))
+                || (node.kind == NodeKind::File && !node.children.is_empty())
+            {
+                return Err("扫描目录结构已失效，请重新扫描。".into());
+            }
+            cursor = parent;
         }
         if cursor != scan.root || names.is_empty() {
             return Err("文件夹不属于扫描根目录。".into());
         }
+        #[cfg(target_os = "macos")]
+        validate_macos_ancestors(&scan.root_path)?;
         #[cfg(target_os = "linux")]
         crate::linux_fs::validate_directory_ancestors(&scan.root_path)
             .map_err(|error| format!("无法安全检查 Linux 文件夹路径：{error}"))?;
@@ -98,9 +250,14 @@ impl DeletionRequest {
         let root_identity = directory_identity(&root)?;
         let mut identities = vec![(root.clone(), root_identity)];
         let mut path = root.clone();
-        for name in names.into_iter().rev() {
+        let count = names.len();
+        for (index, name) in names.into_iter().rev().enumerate() {
             path.push(name);
-            let identity = directory_identity(&path)?;
+            let identity = entry_identity(&path)?;
+            let expected_directory = index + 1 < count || target_directory;
+            if identity.directory != expected_directory {
+                return Err("项目类型已改变，请重新扫描。".into());
+            }
             if identity.device != identities[0].1.device {
                 return Err("不能删除挂载点或跨磁盘的文件夹。".into());
             }
@@ -114,32 +271,76 @@ impl DeletionRequest {
         // The confirmation UI displays Unicode. Refuse names it cannot show
         // exactly, even though Windows APIs can preserve unpaired UTF-16 units.
         if path.to_str().is_none() {
-            return Err("此文件夹路径包含非 UTF-8 / Unicode 名称，无法准确显示确认路径，请在系统文件管理器中处理。".into());
+            return Err("此项目路径包含非 UTF-8 / Unicode 名称，无法准确显示确认路径，请在系统文件管理器中处理。".into());
         }
         let request = Self {
             original_root: scan.root_path.clone(),
             root,
             path,
             identities,
+            mode,
+            subtree: None,
         };
         request.revalidate()?;
         Ok(request)
+    }
+
+    /// Capture before showing confirmation. Dropping this request or a worker's
+    /// result cancels preparation without deleting anything.
+    pub fn snapshot_contents(self) -> Result<Self, String> {
+        self.snapshot_contents_with_cancel(&AtomicBool::new(false))
+    }
+
+    pub fn snapshot_contents_with_cancel(mut self, cancelled: &AtomicBool) -> Result<Self, String> {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("已取消内容检查；没有删除任何项目。".into());
+        }
+        self.revalidate()?;
+        if self.mode == DeletionMode::Permanent
+            && self
+                .identities
+                .last()
+                .is_some_and(|(_, identity)| identity.directory)
+        {
+            self.subtree = Some(snapshot_subtree(
+                &self.path,
+                self.identities[0].1.device,
+                cancelled,
+            )?);
+            self.revalidate()?;
+        }
+        Ok(self)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    pub fn mode(&self) -> DeletionMode {
+        self.mode
+    }
+
     fn revalidate(&self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            validate_macos_ancestors(&self.original_root)?;
+            validate_macos_ancestors(self.path.parent().ok_or("路径没有上级目录。")?)?;
+        }
         #[cfg(target_os = "linux")]
         {
             crate::linux_fs::validate_directory_ancestors(&self.original_root)
-                .and_then(|()| crate::linux_fs::validate_directory_ancestors(&self.path))
+                .and_then(|()| {
+                    crate::linux_fs::validate_directory_ancestors(
+                        self.path
+                            .parent()
+                            .ok_or_else(|| std::io::Error::other("Missing parent"))?,
+                    )
+                })
                 .map_err(|error| format!("无法安全检查 Linux 文件夹路径：{error}"))?;
             let mounts = crate::linux_fs::MountTable::read()
-                .map_err(|error| format!("无法读取 Linux 挂载信息，已取消回收操作：{error}"))?;
+                .map_err(|error| format!("无法读取 Linux 挂载信息，已取消删除操作：{error}"))?;
             if mounts.has_mount_at_or_below(&self.path) {
-                return Err("不能回收挂载点或包含挂载点的文件夹（包括 bind mount）。".into());
+                return Err("不能删除挂载点或包含挂载点的项目（包括 bind mount）。".into());
             }
         }
         #[cfg(windows)]
@@ -158,18 +359,77 @@ impl DeletionRequest {
             return Err("扫描根目录已改变，请重新扫描。".into());
         }
         for (path, expected) in &self.identities {
-            if directory_identity(path)? != *expected {
-                return Err("文件夹或上级目录已改变，已取消操作。请重新扫描。".into());
+            if entry_identity(path)? != *expected {
+                return Err("项目或上级目录已改变，已取消操作。请重新扫描。".into());
             }
         }
         Ok(())
     }
 
     pub fn execute(self) -> Result<(), String> {
-        self.execute_with(move_to_trash)
+        match self.mode {
+            DeletionMode::Trash => self.execute_with(move_to_trash),
+            DeletionMode::Permanent => {
+                self.revalidate()?;
+                if let Some(subtree) = &self.subtree {
+                    if snapshot_subtree(
+                        &self.path,
+                        self.identities[0].1.device,
+                        &AtomicBool::new(false),
+                    )? != *subtree
+                    {
+                        return Err("文件夹内容已改变，已取消操作。请重新扫描并确认。".into());
+                    }
+                    // Never recursively sweep a live directory: remove exactly
+                    // the confirmed entries. New children make remove_dir fail.
+                    for (path, expected) in subtree.iter().rev() {
+                        let remove = || -> Result<(), String> {
+                            self.revalidate()?;
+                            for ancestor in path
+                                .ancestors()
+                                .skip(1)
+                                .take_while(|p| p.starts_with(&self.path))
+                            {
+                                let expected = subtree.get(ancestor).ok_or("目录结构已改变。")?;
+                                if directory_identity(ancestor)? != expected.identity {
+                                    return Err("上级目录已改变。".into());
+                                }
+                            }
+                            #[cfg(windows)]
+                            validate_windows_ancestors(path)?;
+                            if subtree_entry(path)? != *expected {
+                                return Err("子项目已改变。".into());
+                            }
+                            if expected.identity.directory {
+                                fs::remove_dir(path)
+                            } else {
+                                fs::remove_file(path)
+                            }
+                            .map_err(|e| e.to_string())
+                        };
+                        remove().map_err(|error| {
+                            format!("彻底删除中止：{error}。部分已确认项目可能已删除，请重新扫描。")
+                        })?;
+                    }
+                    Ok(())
+                } else {
+                    if self
+                        .identities
+                        .last()
+                        .is_none_or(|(_, identity)| identity.directory)
+                    {
+                        return Err("文件夹尚未完成内容检查，已取消彻底删除。".into());
+                    }
+                    fs::remove_file(&self.path).map_err(|error| format!("彻底删除失败：{error}"))
+                }
+            }
+        }
     }
 
     fn execute_with(self, trash: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+        if self.mode != DeletionMode::Trash {
+            return Err("确认的删除方式与回收站操作不一致。".into());
+        }
         self.revalidate()?;
         trash(&self.path)
     }
@@ -179,7 +439,10 @@ impl DeletionRequest {
 fn move_to_trash(path: &Path) -> Result<(), String> {
     use objc2_foundation::{NSFileManager, NSString, NSURL};
     let exact = path.to_str().ok_or("无法无损转换文件夹路径。")?;
-    let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(exact), true);
+    let url = NSURL::fileURLWithPath_isDirectory(
+        &NSString::from_str(exact),
+        entry_identity(path)?.directory,
+    );
     NSFileManager::defaultManager()
         .trashItemAtURL_resultingItemURL_error(&url, None)
         .map_err(|error| {
@@ -263,7 +526,7 @@ mod tests {
             fs::create_dir(&path).unwrap();
             fs::create_dir_all(path.join("parent/child")).unwrap();
             fs::write(path.join("file"), b"synthetic fixture").unwrap();
-            Self(path)
+            Self(fs::canonicalize(path).unwrap())
         }
         fn scan(&self) -> ScanOutcome {
             scan(&self.0, &AtomicBool::new(false), |_| {}).unwrap()
@@ -420,10 +683,422 @@ mod tests {
     }
 
     #[test]
-    fn rejects_root_files_and_invalid_ids() {
+    fn regular_file_trash_preserves_exact_path_and_never_falls_back() {
         let fixture = Fixture::new();
         let scan = fixture.scan();
-        for target in [scan.root, id(&scan, "file"), usize::MAX] {
+        let request = DeletionRequest::prepare(&scan, id(&scan, "file")).unwrap();
+        assert_eq!(request.mode(), DeletionMode::Trash);
+        let expected = fixture.0.join("file");
+        assert_eq!(request.path(), expected);
+        assert_eq!(
+            request.execute_with(|path| {
+                assert_eq!(path, expected);
+                Err("mock trash unavailable".into())
+            }),
+            Err("mock trash unavailable".into())
+        );
+        assert_eq!(fs::read(expected).unwrap(), b"synthetic fixture");
+    }
+
+    #[test]
+    fn permanent_file_deletion_only_removes_confirmed_synthetic_file() {
+        let fixture = Fixture::new();
+        let scan = fixture.scan();
+        let request =
+            DeletionRequest::prepare_with_mode(&scan, id(&scan, "file"), DeletionMode::Permanent)
+                .unwrap();
+        assert_eq!(request.mode(), DeletionMode::Permanent);
+        request.execute().unwrap();
+        assert!(!fixture.0.join("file").exists());
+        assert!(fixture.0.join("parent/child").is_dir());
+        assert!(fixture.0.is_dir());
+    }
+
+    fn permanent_folder(fixture: &Fixture) -> DeletionRequest {
+        let scan = fixture.scan();
+        DeletionRequest::prepare_with_mode(&scan, id(&scan, "parent"), DeletionMode::Permanent)
+            .unwrap()
+    }
+
+    #[test]
+    fn permanent_folder_removes_nested_and_empty_unicode_directories() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.0.join("parent/中文-é/empty")).unwrap();
+        fs::write(fixture.0.join("parent/中文-é/内容🦀"), b"payload").unwrap();
+        fs::write(fixture.0.join("parent/child/nested"), b"nested").unwrap();
+        fs::hard_link(
+            fixture.0.join("parent/child/nested"),
+            fixture.0.join("outside-link"),
+        )
+        .unwrap();
+        permanent_folder(&fixture).execute().unwrap();
+        assert!(!fixture.0.join("parent").exists());
+        assert_eq!(fs::read(fixture.0.join("outside-link")).unwrap(), b"nested");
+        assert_eq!(
+            fs::read(fixture.0.join("file")).unwrap(),
+            b"synthetic fixture"
+        );
+    }
+
+    #[test]
+    fn target_only_folder_request_cannot_execute_without_snapshot() {
+        let fixture = Fixture::new();
+        let scan = fixture.scan();
+        let request = DeletionRequest::prepare_target_with_mode(
+            &scan,
+            id(&scan, "parent"),
+            DeletionMode::Permanent,
+        )
+        .unwrap();
+        assert!(request.subtree.is_none());
+        assert!(request.execute().is_err());
+        assert!(fixture.0.join("parent/child").is_dir());
+        let request = DeletionRequest::prepare_target_with_mode(
+            &scan,
+            id(&scan, "parent"),
+            DeletionMode::Permanent,
+        )
+        .unwrap();
+        request.snapshot_contents().unwrap().execute().unwrap();
+        assert!(!fixture.0.join("parent").exists());
+    }
+
+    #[test]
+    fn cancelled_folder_snapshot_never_deletes() {
+        let fixture = Fixture::new();
+        let scan = fixture.scan();
+        let request = DeletionRequest::prepare_target_with_mode(
+            &scan,
+            id(&scan, "parent"),
+            DeletionMode::Permanent,
+        )
+        .unwrap();
+        assert!(request
+            .snapshot_contents_with_cancel(&AtomicBool::new(true))
+            .is_err());
+        assert!(fixture.0.join("parent/child").is_dir());
+        assert!(snapshot_subtree(
+            &fixture.0.join("parent"),
+            directory_identity(&fixture.0).unwrap().device,
+            &AtomicBool::new(true)
+        )
+        .is_err());
+        assert!(fixture.0.join("parent/child").is_dir());
+    }
+
+    #[test]
+    fn dropping_folder_confirmation_keeps_everything() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("parent/child/payload"), b"payload").unwrap();
+        drop(permanent_folder(&fixture));
+        assert_eq!(
+            fs::read(fixture.0.join("parent/child/payload")).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn changed_descendants_cancel_before_any_deletion() {
+        for change in ["add", "remove", "replace", "edit", "directory"] {
+            let fixture = Fixture::new();
+            let payload = fixture.0.join("parent/child/payload");
+            fs::write(&payload, b"original").unwrap();
+            fs::write(fixture.0.join("parent/untouched"), b"untouched").unwrap();
+            let request = permanent_folder(&fixture);
+            match change {
+                "add" => fs::write(fixture.0.join("parent/new-file"), b"new").unwrap(),
+                "remove" => fs::rename(&payload, fixture.0.join("saved")).unwrap(),
+                "replace" => {
+                    fs::rename(&payload, fixture.0.join("saved")).unwrap();
+                    fs::write(&payload, b"replacement").unwrap();
+                }
+                "edit" => fs::write(&payload, b"different size payload").unwrap(),
+                _ => {
+                    fs::rename(
+                        fixture.0.join("parent/child"),
+                        fixture.0.join("saved-child"),
+                    )
+                    .unwrap();
+                    fs::create_dir(fixture.0.join("parent/child")).unwrap();
+                }
+            }
+            assert!(request.execute().is_err(), "{change}");
+            assert_eq!(
+                fs::read(fixture.0.join("parent/untouched")).unwrap(),
+                b"untouched"
+            );
+            assert!(fixture.0.join("parent/child").is_dir());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descendant_symlinks_are_rejected_and_outside_targets_survive() {
+        for after_confirmation in [false, true] {
+            let fixture = Fixture::new();
+            let outside = Fixture::new();
+            let request = after_confirmation.then(|| permanent_folder(&fixture));
+            symlink(&outside.0, fixture.0.join("parent/child/outside")).unwrap();
+            if let Some(request) = request {
+                assert!(request.execute().is_err());
+            } else {
+                let scan = fixture.scan();
+                assert!(DeletionRequest::prepare_with_mode(
+                    &scan,
+                    id(&scan, "parent"),
+                    DeletionMode::Permanent
+                )
+                .is_err());
+            }
+            assert_eq!(
+                fs::read(outside.0.join("file")).unwrap(),
+                b"synthetic fixture"
+            );
+            assert!(fs::symlink_metadata(fixture.0.join("parent/child/outside"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn permanent_folder_rejects_non_unicode_descendant() {
+        let fixture = Fixture::new();
+        let name = OsString::from_vec(b"invalid-\xff".to_vec());
+        let path = fixture.0.join("parent").join(name);
+        fs::write(&path, b"preserve").unwrap();
+        let scan = fixture.scan();
+        assert!(DeletionRequest::prepare_with_mode(
+            &scan,
+            id(&scan, "parent"),
+            DeletionMode::Permanent
+        )
+        .is_err());
+        assert_eq!(fs::read(path).unwrap(), b"preserve");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn permanent_folder_rejects_descendant_junction() {
+        let fixture = Fixture::new();
+        let outside = Fixture::new();
+        let request = permanent_folder(&fixture);
+        let junction = fixture.0.join("parent/child/junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside.0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "synthetic junction creation failed");
+        assert!(request.execute().is_err());
+        let scan = fixture.scan();
+        assert!(DeletionRequest::prepare_with_mode(
+            &scan,
+            id(&scan, "parent"),
+            DeletionMode::Permanent
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(outside.0.join("file")).unwrap(),
+            b"synthetic fixture"
+        );
+        fs::remove_dir(junction).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subtree_mount_guard_rejects_nested_and_file_bind_mounts() {
+        for mount in [
+            "/scan/parent",
+            "/scan/parent/child",
+            "/scan/parent/child/file",
+        ] {
+            let description = format!("1 0 8:1 / / rw - ext4 /dev/sda rw\n2 1 8:1 /source {mount} rw - ext4 /dev/sda rw\n");
+            let mounts = crate::linux_fs::MountTable::parse(description.as_bytes()).unwrap();
+            assert!(reject_linux_subtree_mounts(Path::new("/scan/parent"), &mounts).is_err());
+            assert!(reject_linux_subtree_mounts(Path::new("/scan/sibling"), &mounts).is_ok());
+        }
+    }
+
+    #[test]
+    fn permanent_deletion_preserves_other_hard_links() {
+        let fixture = Fixture::new();
+        fs::hard_link(fixture.0.join("file"), fixture.0.join("other-link")).unwrap();
+        let scan = fixture.scan();
+        DeletionRequest::prepare_with_mode(&scan, id(&scan, "file"), DeletionMode::Permanent)
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert!(!fixture.0.join("file").exists());
+        assert_eq!(
+            fs::read(fixture.0.join("other-link")).unwrap(),
+            b"synthetic fixture"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires /usr/bin/gio; uses only an isolated synthetic HOME/Trash"]
+    fn linux_gio_file_round_trip_in_isolated_trash() {
+        let fixture = Fixture::new();
+        let data = fixture.0.join("data");
+        fs::create_dir(&data).unwrap();
+        let scan = fixture.scan();
+        let request = DeletionRequest::prepare(&scan, id(&scan, "file")).unwrap();
+        request
+            .execute_with(|path| {
+                linux_trash_with(path, |path| {
+                    std::process::Command::new("/usr/bin/gio")
+                        .args(["trash", "--"])
+                        .arg(path)
+                        .env("HOME", &fixture.0)
+                        .env("XDG_DATA_HOME", &data)
+                        .env("GIO_USE_VFS", "local")
+                        .output()
+                })
+            })
+            .unwrap();
+        assert!(!fixture.0.join("file").exists());
+        let files: Vec<_> = fs::read_dir(data.join("Trash/files"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let infos: Vec<_> = fs::read_dir(data.join("Trash/info"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(fs::read(files[0].path()).unwrap(), b"synthetic fixture");
+        let info = fs::read_to_string(infos[0].path()).unwrap();
+        assert!(info.starts_with("[Trash Info]\n"));
+        assert!(info.contains("Path="));
+        assert!(info.contains("DeletionDate="));
+        fs::rename(files[0].path(), fixture.0.join("file")).unwrap();
+        assert_eq!(
+            fs::read(fixture.0.join("file")).unwrap(),
+            b"synthetic fixture"
+        );
+    }
+
+    #[test]
+    fn permanent_mode_rejects_root_and_cannot_use_trash_dispatch() {
+        let fixture = Fixture::new();
+        let scan = fixture.scan();
+        for target in [scan.root, usize::MAX] {
+            assert!(
+                DeletionRequest::prepare_with_mode(&scan, target, DeletionMode::Permanent).is_err()
+            );
+        }
+        let request =
+            DeletionRequest::prepare_with_mode(&scan, id(&scan, "file"), DeletionMode::Permanent)
+                .unwrap();
+        assert!(request
+            .execute_with(|_| panic!("must not change confirmed mode"))
+            .is_err());
+        assert!(fixture.0.join("file").is_file());
+    }
+
+    #[test]
+    fn file_replacement_kind_change_and_disappearance_cancel_both_modes() {
+        for mode in [DeletionMode::Trash, DeletionMode::Permanent] {
+            for replacement in ["file", "directory", "missing"] {
+                let fixture = Fixture::new();
+                let scan = fixture.scan();
+                let request =
+                    DeletionRequest::prepare_with_mode(&scan, id(&scan, "file"), mode).unwrap();
+                let path = fixture.0.join("file");
+                fs::rename(&path, fixture.0.join("saved-file")).unwrap();
+                match replacement {
+                    "file" => fs::write(&path, b"replacement").unwrap(),
+                    "directory" => fs::create_dir(&path).unwrap(),
+                    _ => (),
+                }
+                let result = if mode == DeletionMode::Trash {
+                    request.execute_with(|_| panic!("must not trash replacement"))
+                } else {
+                    request.execute()
+                };
+                assert!(result.is_err());
+                assert_eq!(
+                    fs::read(fixture.0.join("saved-file")).unwrap(),
+                    b"synthetic fixture"
+                );
+                if replacement == "file" {
+                    assert_eq!(fs::read(&path).unwrap(), b"replacement");
+                }
+                if replacement == "directory" {
+                    assert!(path.is_dir());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn permanent_file_rejects_replaced_ancestor() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("parent/nested-file"), b"original").unwrap();
+        let scan = fixture.scan();
+        let request = DeletionRequest::prepare_with_mode(
+            &scan,
+            id(&scan, "nested-file"),
+            DeletionMode::Permanent,
+        )
+        .unwrap();
+        fs::rename(fixture.0.join("parent"), fixture.0.join("saved-parent")).unwrap();
+        fs::create_dir(fixture.0.join("parent")).unwrap();
+        fs::write(fixture.0.join("parent/nested-file"), b"replacement").unwrap();
+        assert!(request.execute().is_err());
+        assert_eq!(
+            fs::read(fixture.0.join("parent/nested-file")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_file_rejects_symlink_swap() {
+        let fixture = Fixture::new();
+        let scan = fixture.scan();
+        let request =
+            DeletionRequest::prepare_with_mode(&scan, id(&scan, "file"), DeletionMode::Permanent)
+                .unwrap();
+        fs::rename(fixture.0.join("file"), fixture.0.join("saved-file")).unwrap();
+        symlink("saved-file", fixture.0.join("file")).unwrap();
+        assert!(request.execute().is_err());
+        assert!(fs::symlink_metadata(fixture.0.join("file"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read(fixture.0.join("saved-file")).unwrap(),
+            b"synthetic fixture"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_symlink_above_scan_root() {
+        let fixture = Fixture::new();
+        let container = Fixture::new();
+        symlink(&fixture.0, container.0.join("alias")).unwrap();
+        let mut scan = fixture.scan();
+        scan.root_path = container.0.join("alias");
+        assert!(DeletionRequest::prepare_with_mode(
+            &scan,
+            id(&scan, "file"),
+            DeletionMode::Permanent
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_root_and_invalid_ids() {
+        let fixture = Fixture::new();
+        let scan = fixture.scan();
+        for target in [scan.root, usize::MAX] {
             assert!(DeletionRequest::prepare(&scan, target).is_err());
         }
     }
@@ -734,8 +1409,12 @@ fn validate_windows_ancestors(path: &Path) -> Result<(), String> {
         }
     }
     let mut expected_volume = None;
-    for ancestor in absolute.ancestors() {
-        let identity = directory_identity(ancestor)?;
+    for (index, ancestor) in absolute.ancestors().enumerate() {
+        let identity = if index == 0 {
+            entry_identity(ancestor)?
+        } else {
+            directory_identity(ancestor)?
+        };
         if expected_volume.is_some_and(|volume| volume != identity.device) {
             return Err("不能删除挂载点或跨磁盘的文件夹。".into());
         }
@@ -818,9 +1497,9 @@ mod windows_recycle {
             let path = PathBuf::from(unsafe { std::ffi::OsString::from_wide(resolved.as_wide()) });
             unsafe { CoTaskMemFree(Some(resolved.0.cast())) };
             if validate_windows_ancestors(&path).is_err()
-                || directory_identity(&path).ok().as_ref() != Some(&self.expected)
+                || entry_identity(&path).ok().as_ref() != Some(&self.expected)
             {
-                return self.reject("Shell 项目与已确认的文件夹不一致，已取消操作。");
+                return self.reject("Shell 项目与已确认的项目不一致，已取消操作。");
             }
             Ok(())
         }
@@ -834,7 +1513,7 @@ mod windows_recycle {
             // A success-like skip code is not a completed recycle. A nonnull
             // destination is documented to identify the item in the Recycle Bin.
             if result != HRESULT(0) || recycled.is_none() {
-                return self.reject("未能确认文件夹已进入回收站。请检查文件夹位置。");
+                return self.reject("未能确认项目已进入回收站。请检查项目位置。");
             }
             self.outcome.lock().unwrap().completed = true;
             Ok(())
@@ -933,7 +1612,7 @@ mod windows_recycle {
 
     pub(super) fn recycle(path: &Path) -> Result<(), String> {
         validate_windows_ancestors(path)?;
-        let expected = directory_identity(path)?;
+        let expected = entry_identity(path)?;
         let exact = exact_windows_path(path)?;
         // execute() runs on a fresh worker. Never borrow an incompatible COM
         // apartment; failed initialization leaves the filesystem untouched.
@@ -996,6 +1675,7 @@ mod windows_recycle {
                     expected: Identity {
                         device: 1,
                         inode: 1,
+                        directory: true,
                     },
                 }
                 .into(),

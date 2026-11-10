@@ -9,9 +9,17 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::{ops::Range, path::PathBuf, sync::mpsc, time::Duration};
+use std::{
+    ops::Range,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    time::Duration,
+};
 use tree_lens::{
-    deletion::DeletionRequest,
+    deletion::{DeletionMode, DeletionRequest},
     footprint::{self, Tile},
     format_bytes,
     platform::{self, DELETE_LABEL, TRASH_NAME, TRASH_SUPPORTED},
@@ -84,6 +92,19 @@ pub fn install_theme(cx: &mut App) {
     ]);
 }
 
+struct DeletionPreparation {
+    generation: u64,
+    id: NodeId,
+    receiver: mpsc::Receiver<Result<DeletionRequest, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for DeletionPreparation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 pub struct TreeLensApp {
     session: Session,
     path_input: Entity<InputState>,
@@ -98,9 +119,11 @@ pub struct TreeLensApp {
     _ticker: Task<()>,
     picker: Option<Task<()>>,
     pending_deletion: Option<(u64, DeletionRequest)>,
+    preparing_deletion: Option<DeletionPreparation>,
     deletion: Option<mpsc::Receiver<Result<(), String>>>,
     deletion_notice: Option<String>,
-    trash_operation: fn(DeletionRequest) -> Result<(), String>,
+    deletion_mode: Option<DeletionMode>,
+    delete_operation: fn(DeletionRequest) -> Result<(), String>,
 }
 
 impl TreeLensApp {
@@ -138,6 +161,7 @@ impl TreeLensApp {
                 .await;
             if this
                 .update_in(cx, |this, window, cx| {
+                    this.poll_deletion_preparation(window, cx);
                     this.poll_deletion(window, cx);
                     let was_busy = this.session.busy();
                     let search_pending = this.session.query != this.session.applied_query();
@@ -173,9 +197,11 @@ impl TreeLensApp {
             _ticker: ticker,
             picker: None,
             pending_deletion: None,
+            preparing_deletion: None,
             deletion: None,
             deletion_notice: None,
-            trash_operation: DeletionRequest::execute,
+            deletion_mode: None,
+            delete_operation: DeletionRequest::execute,
         };
         if let Some(path) = initial {
             app.start(path, window, cx);
@@ -318,45 +344,161 @@ impl TreeLensApp {
     }
 
     fn busy(&self) -> bool {
-        self.session.busy() || self.deletion.is_some()
+        self.session.busy() || self.deletion.is_some() || self.preparing_deletion.is_some()
     }
 
-    fn deletable_folder(&self, id: NodeId) -> bool {
+    fn deletable_item(&self, id: NodeId, _mode: DeletionMode) -> bool {
         !self.busy()
             && !self.choosing
             && self.session.result.as_ref().is_some_and(|scan| {
                 id != scan.root
                     && scan.nodes.get(id).is_some_and(|node| {
-                        node.kind == NodeKind::Directory && node.error.is_none()
+                        node.error.is_none()
+                            && matches!(node.kind, NodeKind::File | NodeKind::Directory)
                     })
             })
     }
 
     fn request_delete(&mut self, id: NodeId, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.deletable_folder(id) || window.has_active_dialog(cx) {
+        self.request_delete_mode(id, DeletionMode::Trash, window, cx);
+    }
+
+    fn request_delete_mode(
+        &mut self,
+        id: NodeId,
+        mode: DeletionMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !TRASH_SUPPORTED || !self.deletable_item(id, mode) || window.has_active_dialog(cx) {
             return;
         }
         let scan = self.session.result.as_ref().expect("deletable scan");
-        let request = match DeletionRequest::prepare(scan, id) {
+        let request = match DeletionRequest::prepare_target_with_mode(scan, id, mode) {
             Ok(request) => request,
             Err(error) => {
                 self.deletion_notice = None;
-                self.session.status = format!("无法删除文件夹：{error}");
+                self.session.status = format!("无法删除项目：{error}");
                 cx.notify();
                 return;
             }
         };
+        if mode == DeletionMode::Permanent && scan.nodes[id].kind == NodeKind::Directory {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker_cancelled = Arc::clone(&cancelled);
+            match std::thread::Builder::new()
+                .name("prepare-folder-deletion".into())
+                .spawn(move || {
+                    let _ = sender.send(request.snapshot_contents_with_cancel(&worker_cancelled));
+                }) {
+                Ok(_) => {
+                    self.preparing_deletion = Some(DeletionPreparation {
+                        generation: self.generation,
+                        id,
+                        receiver,
+                        cancelled,
+                    });
+                    self.deletion_notice = None;
+                    self.session.status =
+                        "正在核对文件夹全部内容…按 Esc 取消；尚未删除任何项目。".into();
+                }
+                Err(error) => self.session.status = format!("无法准备删除：{error}"),
+            }
+            cx.notify();
+            return;
+        }
+        self.show_delete_confirmation(id, request, window, cx);
+    }
+
+    fn poll_deletion_preparation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let result = match self
+            .preparing_deletion
+            .as_ref()
+            .map(|state| state.receiver.try_recv())
+        {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                Err("文件夹检查意外结束；没有执行删除。".into())
+            }
+            _ => return,
+        };
+        let state = self.preparing_deletion.take().expect("preparation exists");
+        if state.generation != self.generation
+            || self.busy()
+            || self.choosing
+            || window.has_active_dialog(cx)
+        {
+            self.session.status = "准备操作已过期，请重新选择项目；没有执行删除。".into();
+        } else {
+            match result {
+                Ok(request) => self.show_delete_confirmation(state.id, request, window, cx),
+                Err(error) => self.session.status = format!("无法准备彻底删除：{error}"),
+            }
+        }
+        cx.notify();
+    }
+
+    fn show_delete_confirmation(
+        &mut self,
+        id: NodeId,
+        request: DeletionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let scan = self.session.result.as_ref().expect("confirmed scan");
+        let mode = request.mode();
         let path = request.path().display().to_string();
         let size = format_bytes(scan.nodes[id].total_allocated_bytes);
+        let directory = scan.nodes[id].kind == NodeKind::Directory;
+        let permanent = mode == DeletionMode::Permanent;
+        let title = if permanent && directory {
+            "彻底删除整个文件夹？".to_string()
+        } else if permanent {
+            "彻底删除文件？".to_string()
+        } else if directory {
+            format!("将文件夹移到{TRASH_NAME}？")
+        } else {
+            format!("将文件移到{TRASH_NAME}？")
+        };
+        let description = if permanent && directory {
+            format!("这个文件夹及其中的全部子文件、子文件夹将被彻底删除，不会进入{TRASH_NAME}，无法通过本应用或{TRASH_NAME}恢复。此操作不可撤销。")
+        } else if permanent {
+            format!("此文件将被彻底删除，不会进入{TRASH_NAME}，无法通过本应用或{TRASH_NAME}恢复。此操作不可撤销。")
+        } else if directory {
+            format!("这个文件夹及其全部内容将移到{TRASH_NAME}，不会永久删除。")
+        } else {
+            format!("此文件将移到{TRASH_NAME}，不会永久删除。")
+        };
+        let detail = if directory {
+            format!("扫描时的磁盘占用：{size}。包含所有内容，即使被筛选或未完整扫描。")
+        } else {
+            format!("扫描时的磁盘占用：{size}。只删除所选路径，其他硬链接不受影响；实际释放空间可能不同。")
+        };
+        let warning = if permanent && directory {
+            "请核对完整路径。执行中发生权限或路径变化等错误时，可能只有部分内容已删除，且无法撤销。此操作不是安全擦除。".to_string()
+        } else if permanent {
+            "请核对完整路径，确认文件不再需要。这不是安全擦除，不保证覆盖磁盘上的数据。".to_string()
+        } else {
+            format!("可在系统{TRASH_NAME}中恢复。移入{TRASH_NAME}不会立即释放空间；本应用不会清空{TRASH_NAME}。")
+        };
+        let confirm_label = if permanent && directory {
+            "彻底删除整个文件夹（不可撤销）".to_string()
+        } else if permanent {
+            "彻底删除（不可撤销）".to_string()
+        } else {
+            format!("移到{TRASH_NAME}")
+        };
         self.session.select(id);
         self.pending_deletion = Some((self.generation, request));
+        self.session.status = "等待删除确认；尚未删除任何项目。".into();
         let view = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
             let cancel_view = view.clone();
             let confirm_view = view.clone();
             let close_view = view.clone();
             dialog
-                .title("删除文件夹？")
+                .title(title.clone())
                 .w(px(600.0))
                 .centered()
                 .overlay_closable(false)
@@ -364,36 +506,65 @@ impl TreeLensApp {
                 .on_ok(|_, _, _| false)
                 .on_close(move |_, _, cx| {
                     let _ = close_view.update(cx, |this, cx| {
-                        this.pending_deletion = None;
+                        if this.pending_deletion.take().is_some() {
+                            this.session.status = "已取消删除；没有删除任何项目。".into();
+                        }
                         cx.notify();
                     });
                 })
                 .child(
-                    div().flex().flex_col().gap_3().text_sm()
-                        .child(format!("这个文件夹及其全部内容将移到{TRASH_NAME}，不会永久删除。"))
-                        .child(div().id("delete-path").test_support().max_h(px(160.0))
-                            .overflow_y_scroll().p_3().rounded_lg().bg(rgb(0x192632))
-                            .child(path.clone()))
-                        .child(format!("扫描时的磁盘占用：{size}。包含所有内容，即使被筛选或未完整扫描。"))
-                        .child(div().text_color(rgb(AMBER)).child(
-                            format!("可在系统{TRASH_NAME}中恢复。移入{TRASH_NAME}不会立即释放空间；本应用不会清空{TRASH_NAME}。"))),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .text_sm()
+                        .child(
+                            div()
+                                .id("delete-warning")
+                                .test_support()
+                                .child(description.clone()),
+                        )
+                        .child(
+                            div()
+                                .id("delete-path")
+                                .test_support()
+                                .max_h(px(160.0))
+                                .overflow_y_scroll()
+                                .p_3()
+                                .rounded_lg()
+                                .bg(rgb(0x192632))
+                                .child(path.clone()),
+                        )
+                        .child(detail.clone())
+                        .child(div().text_color(rgb(AMBER)).child(warning.clone())),
                 )
                 .footer(
-                    div().flex().justify_end().gap_2()
-                        .child(Button::new("delete-cancel").label("取消")
-                            .on_click(move |_, window, cx| {
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(Button::new("delete-cancel").label("取消").on_click(
+                            move |_, window, cx| {
                                 let _ = cancel_view.update(cx, |this, cx| {
-                                    this.pending_deletion = None;
+                                    if this.pending_deletion.take().is_some() {
+                                        this.session.status =
+                                            "已取消删除；没有删除任何项目。".into();
+                                    }
                                     cx.notify();
                                 });
                                 window.close_dialog(cx);
-                            }))
-                        .child(Button::new("delete-confirm").danger().label(format!("移到{TRASH_NAME}"))
-                            .on_click(move |_, window, cx| {
-                                let _ = confirm_view.update(cx, |this, cx| {
-                                    this.confirm_delete(window, cx);
-                                });
-                            })),
+                            },
+                        ))
+                        .child(
+                            Button::new("delete-confirm")
+                                .danger()
+                                .label(confirm_label.clone())
+                                .on_click(move |_, window, cx| {
+                                    let _ = confirm_view.update(cx, |this, cx| {
+                                        this.confirm_delete(window, cx);
+                                    });
+                                }),
+                        ),
                 )
         });
         cx.notify();
@@ -408,7 +579,7 @@ impl TreeLensApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.trash_operation = |_| Err("界面预览不会执行删除。".into());
+        self.delete_operation = |_| Err("界面预览不会执行删除。".into());
         let id = self.session.result.as_ref().and_then(|scan| {
             scan.nodes
                 .iter()
@@ -420,27 +591,56 @@ impl TreeLensApp {
         }
     }
 
+    /// Synthetic file preview: this backend cannot delete anything.
+    #[cfg(feature = "ui-tests")]
+    #[allow(dead_code)]
+    pub(crate) fn preview_file_deletion(
+        &mut self,
+        mode: Option<DeletionMode>,
+        kind: NodeKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_operation = |_| Err("界面预览不会执行删除。".into());
+        if let Some(id) = self.session.result.as_ref().and_then(|scan| {
+            scan.nodes
+                .iter()
+                .find(|node| node.id != scan.root && node.kind == kind)
+                .map(|node| node.id)
+        }) {
+            self.session.select(id);
+            self.session.expand_one_level();
+            self.reset_projection();
+            if let Some(mode) = mode {
+                self.request_delete_mode(id, mode, window, cx);
+            }
+            cx.notify();
+        }
+    }
+
     fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((generation, request)) = self.pending_deletion.take() else {
             return;
         };
         window.close_dialog(cx);
         if generation != self.generation || self.busy() || self.choosing {
-            self.session.status = "扫描结果已变化，请重新选择要删除的文件夹。".into();
+            self.session.status = "扫描结果已变化，请重新选择要删除的项目。".into();
             cx.notify();
             return;
         }
-        let operation = self.trash_operation;
+        let mode = request.mode();
+        let operation = self.delete_operation;
         let (sender, receiver) = mpsc::sync_channel(1);
         match std::thread::Builder::new()
-            .name("folder-trash".into())
+            .name("file-deletion".into())
             .spawn(move || {
                 let _ = sender.send(operation(request));
             }) {
             Ok(_) => {
                 self.deletion = Some(receiver);
+                self.deletion_mode = Some(mode);
                 self.deletion_notice = None;
-                self.session.status = format!("正在移到{TRASH_NAME}…请勿移动或重命名此文件夹。");
+                self.session.status = "正在处理删除…请勿移动或重命名此项目。".into();
             }
             Err(error) => self.session.status = format!("无法启动删除操作：{error}"),
         }
@@ -451,12 +651,12 @@ impl TreeLensApp {
         let result = match self.deletion.as_ref().map(|receiver| receiver.try_recv()) {
             Some(Ok(result)) => result,
             Some(Err(mpsc::TryRecvError::Disconnected)) => Err(
-                "删除线程意外结束。请在系统文件管理器中确认文件夹的位置，再刷新；不会自动重试。"
-                    .into(),
+                "删除线程意外结束。请在系统文件管理器中确认项目状态，再刷新；不会自动重试。".into(),
             ),
             _ => return,
         };
         self.deletion = None;
+        let mode = self.deletion_mode.take().unwrap_or(DeletionMode::Trash);
         match result {
             Ok(()) => {
                 // Rebuild all accounting, including hard-link attribution. Never subtract
@@ -464,12 +664,26 @@ impl TreeLensApp {
                 if let Some(root) = self.session.root_path.clone() {
                     self.start(root, window, cx);
                 }
-                self.deletion_notice =
-                    Some(format!("已移到{TRASH_NAME}，可在系统{TRASH_NAME}中恢复"));
+                self.deletion_notice = Some(match mode {
+                    DeletionMode::Trash => {
+                        format!("已移到{TRASH_NAME}，可在系统{TRASH_NAME}中恢复")
+                    }
+                    DeletionMode::Permanent => "已彻底删除所选项目；此操作不可撤销".into(),
+                });
             }
             Err(error) => {
-                self.deletion_notice = None;
-                self.session.status = format!("未能确认移到{TRASH_NAME}：{error} 请检查后刷新。");
+                let notice = format!("未能确认删除完成：{error} 不会自动重试。");
+                if mode == DeletionMode::Permanent {
+                    // Recursive deletion can fail after removing some entries.
+                    // Always rebuild the projection rather than keep stale totals.
+                    if let Some(root) = self.session.root_path.clone() {
+                        self.start(root, window, cx);
+                    }
+                    self.deletion_notice = Some(notice);
+                } else {
+                    self.deletion_notice = None;
+                    self.session.status = format!("{notice} 请检查后刷新。");
+                }
             }
         }
         cx.notify();
@@ -561,7 +775,7 @@ impl TreeLensApp {
                 div()
                     .text_xs()
                     .text_color(rgb(0x63778c))
-                    .child("GPUI KIT / 0.4.0"),
+                    .child(concat!("GPUI KIT / ", env!("CARGO_PKG_VERSION"))),
             )
     }
 
@@ -603,7 +817,7 @@ impl TreeLensApp {
                             .border_color(rgb(0x354b40))
                             .text_xs()
                             .text_color(rgb(LIME))
-                            .child("●  LOCAL / TRASH"),
+                            .child("●  LOCAL / FILES"),
                     ),
             )
             .child(
@@ -1047,7 +1261,9 @@ impl TreeLensApp {
         let selected = self.session.selected == Some(id);
         let view = cx.entity().downgrade();
         let generation = self.generation;
-        let delete_enabled = TRASH_SUPPORTED && self.deletable_folder(id);
+        let delete_enabled = TRASH_SUPPORTED && self.deletable_item(id, DeletionMode::Trash);
+        let permanent_enabled = TRASH_SUPPORTED && self.deletable_item(id, DeletionMode::Permanent);
+        let file = node.kind == NodeKind::File;
         let icon = match node.kind {
             NodeKind::Directory => IconName::Folder,
             NodeKind::Symlink => IconName::ExternalLink,
@@ -1182,6 +1398,7 @@ impl TreeLensApp {
                 let copy_view = view.clone();
                 let reveal_view = view.clone();
                 let delete_view = view.clone();
+                let permanent_view = view.clone();
                 menu.item(
                     PopupMenuItem::new("复制完整路径").on_click(move |_, _, cx| {
                         let _ = copy_view.update(cx, |this, cx| {
@@ -1202,7 +1419,7 @@ impl TreeLensApp {
                         },
                     ))
                 })
-                .when(directory, |menu| {
+                .when(directory || file, |menu| {
                     menu.separator().item(
                         PopupMenuItem::new(DELETE_LABEL)
                             .disabled(!delete_enabled)
@@ -1210,6 +1427,24 @@ impl TreeLensApp {
                                 let _ = delete_view.update(cx, |this, cx| {
                                     if this.generation == generation {
                                         this.request_delete(id, window, cx);
+                                    }
+                                });
+                            }),
+                    )
+                })
+                .when(directory || file, |menu| {
+                    menu.item(
+                        PopupMenuItem::new("彻底删除…")
+                            .disabled(!permanent_enabled)
+                            .on_click(move |_, window, cx| {
+                                let _ = permanent_view.update(cx, |this, cx| {
+                                    if this.generation == generation {
+                                        this.request_delete_mode(
+                                            id,
+                                            DeletionMode::Permanent,
+                                            window,
+                                            cx,
+                                        );
                                     }
                                 });
                             }),
@@ -1368,21 +1603,42 @@ impl TreeLensApp {
                             .on_click(cx.listener(move |this, _, _, cx| this.reveal(id, cx))),
                     )
                 })
-                .when(node.kind == NodeKind::Directory, |panel| {
+                .when(
+                    matches!(node.kind, NodeKind::Directory | NodeKind::File),
+                    |panel| {
+                        panel.child(
+                            Button::new("delete-selected")
+                                .danger()
+                                .label(DELETE_LABEL)
+                                .disabled(
+                                    !TRASH_SUPPORTED
+                                        || !self.deletable_item(id, DeletionMode::Trash),
+                                )
+                                .tooltip(if id == scan.root {
+                                    "不能删除当前扫描根目录；请先扫描它的父文件夹。"
+                                } else if !TRASH_SUPPORTED {
+                                    "此平台尚不支持移到系统回收站/废纸篓。"
+                                } else {
+                                    "确认后将所选项目移到系统回收站/废纸篓，不永久删除。"
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.request_delete(id, window, cx);
+                                })),
+                        )
+                    },
+                )
+                .when(matches!(node.kind, NodeKind::File | NodeKind::Directory), |panel| {
                     panel.child(
-                        Button::new("delete-selected")
+                        Button::new("delete-permanent-selected")
                             .danger()
-                            .label("删除文件夹…")
-                            .disabled(!TRASH_SUPPORTED || !self.deletable_folder(id))
-                            .tooltip(if id == scan.root {
-                                "不能删除当前扫描根目录；请先扫描它的父文件夹。"
-                            } else if !TRASH_SUPPORTED {
-                                "此平台尚不支持移到系统回收站/废纸篓。"
-                            } else {
-                                "确认后将整个文件夹移到系统回收站/废纸篓，不永久删除。"
-                            })
+                            .label("彻底删除…")
+                            .disabled(
+                                !TRASH_SUPPORTED
+                                    || !self.deletable_item(id, DeletionMode::Permanent),
+                            )
+                            .tooltip("单独确认后彻底删除所选项目及文件夹全部内容，不进入回收站/废纸篓，无法撤销。")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.request_delete(id, window, cx);
+                                this.request_delete_mode(id, DeletionMode::Permanent, window, cx);
                             })),
                     )
                 });
@@ -1403,8 +1659,13 @@ impl TreeLensApp {
     }
 
     fn status_bar(&self, cx: &mut Context<Self>) -> Div {
-        let status = if self.deletion.is_some() {
-            format!("正在移到{TRASH_NAME}…请勿移动或重命名此文件夹。")
+        let status = if self.preparing_deletion.is_some() {
+            "正在核对文件夹全部内容…按 Esc 取消；尚未删除任何项目。".into()
+        } else if self.deletion.is_some() {
+            match self.deletion_mode {
+                Some(DeletionMode::Permanent) => "正在彻底删除…请勿移动或重命名。".into(),
+                _ => format!("正在移到{TRASH_NAME}…请勿移动或重命名此项目。"),
+            }
         } else if self.session.busy() {
             format!(
                 "已检查 {} 个项目 · {}",
@@ -1460,7 +1721,7 @@ impl TreeLensApp {
             .when(issue_count > 0, |el| {
                 el.child(
                     Button::new("issues")
-                        .disabled(self.deletion.is_some())
+                        .disabled(self.deletion.is_some() || self.preparing_deletion.is_some())
                         .ghost()
                         .xsmall()
                         .label(format!("{issue_count} 处问题"))
@@ -1471,7 +1732,7 @@ impl TreeLensApp {
             })
             .child(
                 Button::new("about")
-                    .disabled(self.deletion.is_some())
+                    .disabled(self.deletion.is_some() || self.preparing_deletion.is_some())
                     .ghost()
                     .xsmall()
                     .label("统计说明")
@@ -1482,7 +1743,10 @@ impl TreeLensApp {
     }
 
     fn show_dialog(&self, issues: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.deletion.is_some() || window.has_active_dialog(cx) {
+        if self.deletion.is_some()
+            || self.preparing_deletion.is_some()
+            || window.has_active_dialog(cx)
+        {
             return;
         }
         let records = if issues {
@@ -1511,8 +1775,8 @@ impl TreeLensApp {
                 }
             } else {
                 for line in [
-                    "Tree Lens 0.4.0 · 原生 Rust / GPUI Kit 0.9",
-                    "扫描只读取文件系统元数据，不读取文件内容，不上传结果。删除文件夹需单独确认，仅移到系统回收站/废纸篓。",
+                    concat!("Tree Lens ", env!("CARGO_PKG_VERSION"), " · 原生 Rust / GPUI Kit 0.9"),
+                    "扫描只读取文件系统元数据，不读取文件内容，不上传结果。文件和文件夹均可移到系统回收站/废纸篓或彻底删除，均需单独确认；彻底删除文件夹会删除其中全部内容。",
                     platform::ALLOCATION_HELP,
                     "不跟随符号链接，不跨入不同设备的挂载点。扫描取消或发生权限错误时，结果只是已扫描部分。",
                     platform::STORAGE_CAVEAT,
@@ -1550,8 +1814,12 @@ impl Render for TreeLensApp {
             }))
             .on_action(cx.listener(|this, _: &CancelScan, window, cx| {
                 if window.has_active_dialog(cx) {
-                    this.pending_deletion = None;
+                    if this.pending_deletion.take().is_some() {
+                        this.session.status = "已取消删除；没有删除任何项目。".into();
+                    }
                     window.close_dialog(cx);
+                } else if this.preparing_deletion.take().is_some() {
+                    this.session.status = "已取消删除准备；没有删除任何项目。".into();
                 } else {
                     this.session.cancel();
                 }
@@ -1690,7 +1958,7 @@ mod ui_tests {
         path::PathBuf,
         time::{Duration, Instant},
     };
-    use tree_lens::{scanner::NodeKind, tree::SortBy};
+    use tree_lens::{deletion::DeletionMode, scanner::NodeKind, tree::SortBy};
 
     fn fixture(
         cx: &mut TestAppContext,
@@ -1847,7 +2115,7 @@ mod ui_tests {
             std::fs::create_dir(&root).unwrap();
             std::fs::create_dir_all(root.join("scan/folder-to-trash")).unwrap();
             std::fs::write(root.join("scan/folder-to-trash/content.txt"), b"synthetic").unwrap();
-            Self(root)
+            Self(std::fs::canonicalize(root).unwrap())
         }
     }
     impl Drop for TrashFixture {
@@ -1859,8 +2127,15 @@ mod ui_tests {
     fn trash_fixture(
         cx: &mut TestAppContext,
     ) -> (TrashFixture, AnyWindowHandle, Entity<TreeLensApp>, usize) {
+        deletion_fixture(cx, 1080.0)
+    }
+
+    fn deletion_fixture(
+        cx: &mut TestAppContext,
+        width: f32,
+    ) -> (TrashFixture, AnyWindowHandle, Entity<TreeLensApp>, usize) {
         let temp = TrashFixture::new();
-        let (handle, view) = fixture(cx, 1080.0, false);
+        let (handle, view) = fixture(cx, width, false);
         let id = cx
             .update_window(handle, |_, window, cx| {
                 view.update(cx, |app, cx| {
@@ -1944,7 +2219,7 @@ mod ui_tests {
         let (temp, handle, view, id) = trash_fixture(cx);
         cx.update_window(handle, |_, window, cx| {
             view.update(cx, |app, cx| {
-                app.trash_operation = mock_trash;
+                app.delete_operation = mock_trash;
                 app.request_delete(id, window, cx);
             });
             window.click("delete-confirm", cx);
@@ -1981,7 +2256,7 @@ mod ui_tests {
         let (temp, handle, view, id) = trash_fixture(cx);
         cx.update_window(handle, |_, window, cx| {
             view.update(cx, |app, cx| {
-                app.trash_operation = |_| Err("mock permission denied".into());
+                app.delete_operation = |_| Err("mock permission denied".into());
                 app.request_delete(id, window, cx);
             });
             window.click("delete-confirm", cx);
@@ -1994,7 +2269,7 @@ mod ui_tests {
                 assert!(!app.busy());
                 assert!(app.session.status.contains("mock permission denied"));
                 assert_eq!(app.session.selected, Some(id));
-                assert!(app.deletable_folder(id));
+                assert!(app.deletable_item(id, DeletionMode::Trash));
                 app.request_delete(id, window, cx);
             });
             assert!(window.has_active_dialog(cx));
@@ -2010,7 +2285,7 @@ mod ui_tests {
         cx.update_window(handle, |_, window, cx| {
             view.update(cx, |app, cx| {
                 let root = app.session.result.as_ref().unwrap().root;
-                assert!(!app.deletable_folder(root));
+                assert!(!app.deletable_item(root, DeletionMode::Trash));
                 app.request_delete(root, window, cx);
                 assert!(app.pending_deletion.is_none());
                 app.request_delete(id, window, cx);
@@ -2056,5 +2331,374 @@ mod ui_tests {
             assert!(view.read(cx).pending_deletion.is_none());
         })
         .unwrap();
+    }
+
+    fn file_fixture(
+        cx: &mut TestAppContext,
+        width: f32,
+    ) -> (TrashFixture, AnyWindowHandle, Entity<TreeLensApp>, usize) {
+        let (temp, handle, view, _) = deletion_fixture(cx, width);
+        let id = cx.update(|cx| {
+            view.update(cx, |app, cx| {
+                let id = app
+                    .session
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .find(|node| node.kind == NodeKind::File)
+                    .unwrap()
+                    .id;
+                app.session.expand_one_level();
+                app.session.select(id);
+                app.reset_projection();
+                cx.notify();
+                id
+            })
+        });
+        (temp, handle, view, id)
+    }
+
+    fn checked_file_operation(request: tree_lens::deletion::DeletionRequest) -> Result<(), String> {
+        let path = request.path();
+        assert_eq!(path.file_name().unwrap(), "content.txt");
+        let fixture = path.parent().unwrap().parent().unwrap().parent().unwrap();
+        assert!(fixture
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("tree-lens-ui-trash-"));
+        match request.mode() {
+            DeletionMode::Trash => {
+                std::fs::rename(path, fixture.join("mock-file-trash")).map_err(|e| e.to_string())
+            }
+            // Execute only after validating that this is our isolated synthetic file.
+            DeletionMode::Permanent => request.execute(),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn file_inspector_buttons_cancel_enter_and_mode_are_safe(cx: &mut TestAppContext) {
+        let (temp, handle, view, id) = file_fixture(cx, 1440.0);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("delete-selected").visible());
+            assert!(window.find("delete-permanent-selected").visible());
+            assert!(window.find("delete-permanent-selected").bounds().bottom() < px(760.0));
+            window.click("delete-permanent-selected", cx);
+            window.render_frame(cx);
+            assert!(window.find("delete-warning").visible());
+            assert!(window.find_by_label("彻底删除（不可撤销）").visible());
+            assert_eq!(
+                view.read(cx).pending_deletion.as_ref().unwrap().1.mode(),
+                DeletionMode::Permanent
+            );
+            window.press("enter", cx);
+            assert!(view.read(cx).deletion.is_none());
+            assert!(window.has_active_dialog(cx));
+            // A second operation cannot switch the visible confirmation's mode.
+            view.update(cx, |app, cx| app.request_delete(id, window, cx));
+            assert_eq!(
+                view.read(cx).pending_deletion.as_ref().unwrap().1.mode(),
+                DeletionMode::Permanent
+            );
+            window.click("delete-cancel", cx);
+            assert!(view.read(cx).pending_deletion.is_none());
+            window.click("delete-selected", cx);
+            assert_eq!(
+                view.read(cx).pending_deletion.as_ref().unwrap().1.mode(),
+                DeletionMode::Trash
+            );
+            window.press("escape", cx);
+            assert!(!window.has_active_dialog(cx));
+            assert!(view.read(cx).pending_deletion.is_none());
+            window.click("delete-permanent-selected", cx);
+            window.render_frame(cx);
+            window.within("dialog-close").click("close", cx);
+            assert!(view.read(cx).pending_deletion.is_none());
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+        assert!(temp.0.join("scan/folder-to-trash/content.txt").is_file());
+    }
+
+    #[gpui_kit::test]
+    fn files_expose_both_context_actions_at_minimum_width(cx: &mut TestAppContext) {
+        let (_temp, handle, view, id) = file_fixture(cx, 1080.0);
+        for mode in [DeletionMode::Trash, DeletionMode::Permanent] {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.right_click(("row", id), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.find_by_label(DELETE_LABEL).visible());
+                assert!(window.find_by_label("彻底删除…").visible());
+                let item = window.find_by_label(if mode == DeletionMode::Trash {
+                    DELETE_LABEL
+                } else {
+                    "彻底删除…"
+                });
+                window.click(item.path().last().unwrap().clone(), cx);
+                assert_eq!(
+                    view.read(cx).pending_deletion.as_ref().unwrap().1.mode(),
+                    mode
+                );
+                window.render_frame(cx);
+                assert!(window.find("delete-confirm").bounds().bottom() < px(760.0));
+                window.press("escape", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn permanent_confirmation_is_single_use_and_refreshes_file_counts(cx: &mut TestAppContext) {
+        let (temp, handle, view, id) = file_fixture(cx, 1080.0);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.delete_operation = checked_file_operation;
+                app.request_delete_mode(id, DeletionMode::Permanent, window, cx);
+            });
+            window.click("delete-confirm", cx);
+            view.update(cx, |app, cx| {
+                assert!(app.pending_deletion.is_none());
+                assert!(app.deletion.is_some());
+                app.confirm_delete(window, cx);
+                let generation = app.generation;
+                app.start(temp.0.clone(), window, cx);
+                assert_eq!(app.generation, generation);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.busy() && Instant::now() < deadline {
+                    app.poll_deletion(window, cx);
+                    app.session.poll();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(!app.busy());
+                let scan = app.session.result.as_ref().unwrap();
+                assert_eq!(app.session.selected, Some(scan.root));
+                assert_eq!(scan.nodes[scan.root].file_count, 0);
+                assert!(app.deletion_notice.as_ref().unwrap().contains("已彻底删除"));
+            });
+        })
+        .unwrap();
+        assert!(!temp.0.join("scan/folder-to-trash/content.txt").exists());
+        assert!(temp.0.join("scan/folder-to-trash").is_dir());
+    }
+
+    #[gpui_kit::test]
+    fn file_trash_failure_never_changes_mode_or_removes_file(cx: &mut TestAppContext) {
+        let (temp, handle, view, id) = file_fixture(cx, 1080.0);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.delete_operation = |request| {
+                    assert_eq!(request.mode(), DeletionMode::Trash);
+                    Err("mock trash unavailable".into())
+                };
+                app.request_delete(id, window, cx);
+            });
+            window.click("delete-confirm", cx);
+            view.update(cx, |app, cx| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.deletion.is_some() && Instant::now() < deadline {
+                    app.poll_deletion(window, cx);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(app.session.status.contains("mock trash unavailable"));
+                assert!(app.deletion_notice.is_none());
+                assert_eq!(app.session.selected, Some(id));
+                app.request_delete_mode(id, DeletionMode::Permanent, window, cx);
+                assert_eq!(
+                    app.pending_deletion.as_ref().unwrap().1.mode(),
+                    DeletionMode::Permanent
+                );
+            });
+            window.click("delete-cancel", cx);
+        })
+        .unwrap();
+        assert!(temp.0.join("scan/folder-to-trash/content.txt").is_file());
+    }
+    #[gpui_kit::test]
+    fn file_trash_success_preserves_recoverable_content_and_refreshes(cx: &mut TestAppContext) {
+        let (temp, handle, view, id) = file_fixture(cx, 1080.0);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.delete_operation = checked_file_operation;
+                app.request_delete(id, window, cx);
+            });
+            window.click("delete-confirm", cx);
+            view.update(cx, |app, cx| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.busy() && Instant::now() < deadline {
+                    app.poll_deletion(window, cx);
+                    app.session.poll();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(!app.busy());
+                let scan = app.session.result.as_ref().unwrap();
+                assert_eq!(scan.nodes[scan.root].file_count, 0);
+                assert_eq!(app.session.selected, Some(scan.root));
+                assert!(app.deletion_notice.as_ref().unwrap().contains(TRASH_NAME));
+            });
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(temp.0.join("mock-file-trash")).unwrap(),
+            b"synthetic"
+        );
+        assert!(!temp.0.join("scan/folder-to-trash/content.txt").exists());
+    }
+    #[gpui_kit::test]
+    fn folder_permanent_warning_cancel_and_recursive_confirmation(cx: &mut TestAppContext) {
+        let (temp, handle, view, id) = deletion_fixture(cx, 1440.0);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.session.select(id);
+                app.delete_operation = |request| {
+                    assert_eq!(request.mode(), DeletionMode::Permanent);
+                    assert_eq!(request.path().file_name().unwrap(), "folder-to-trash");
+                    assert!(request
+                        .path()
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("tree-lens-ui-trash-"));
+                    request.execute()
+                };
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.find("delete-permanent-selected").visible());
+            window.click("delete-permanent-selected", cx);
+            wait_for_deletion_preparation(&view, window, cx);
+            window.render_frame(cx);
+            assert!(window
+                .find_by_label("彻底删除整个文件夹（不可撤销）")
+                .visible());
+            assert!(window.find("delete-confirm").bounds().bottom() < px(760.0));
+            window.press("enter", cx);
+            assert!(window.has_active_dialog(cx));
+            assert!(view.read(cx).deletion.is_none());
+            window.click("delete-cancel", cx);
+            assert!(temp.0.join("scan/folder-to-trash/content.txt").is_file());
+            window.click("delete-permanent-selected", cx);
+            wait_for_deletion_preparation(&view, window, cx);
+            window.click("delete-confirm", cx);
+            view.update(cx, |app, cx| {
+                assert!(app.pending_deletion.is_none());
+                app.confirm_delete(window, cx);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.busy() && Instant::now() < deadline {
+                    app.poll_deletion(window, cx);
+                    app.session.poll();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(!app.busy());
+                let scan = app.session.result.as_ref().unwrap();
+                assert_eq!(scan.nodes.len(), 1);
+                assert_eq!(app.session.selected, Some(scan.root));
+                assert!(app.deletion_notice.as_ref().unwrap().contains("已彻底删除"));
+            });
+        })
+        .unwrap();
+        assert!(!temp.0.join("scan/folder-to-trash").exists());
+        assert!(temp.0.join("scan").is_dir());
+    }
+    fn wait_for_deletion_preparation(
+        view: &Entity<TreeLensApp>,
+        window: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::App,
+    ) {
+        view.update(cx, |app, cx| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.preparing_deletion.is_some() && Instant::now() < deadline {
+                app.poll_deletion_preparation(window, cx);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(app.preparing_deletion.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn cancelling_folder_preparation_never_opens_confirmation_or_deletes(cx: &mut TestAppContext) {
+        let (temp, handle, view, id) = deletion_fixture(cx, 1080.0);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.request_delete_mode(id, DeletionMode::Permanent, window, cx)
+            });
+            assert!(view.read(cx).preparing_deletion.is_some());
+            let generation = view.read(cx).generation;
+            view.update(cx, |app, cx| app.start(temp.0.clone(), window, cx));
+            assert_eq!(view.read(cx).generation, generation);
+            window.press("escape", cx);
+            assert!(view.read(cx).preparing_deletion.is_none());
+            assert!(view.read(cx).pending_deletion.is_none());
+            assert!(view.read(cx).deletion.is_none());
+            std::thread::sleep(Duration::from_millis(20));
+            view.update(cx, |app, cx| app.poll_deletion_preparation(window, cx));
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+        assert!(temp.0.join("scan/folder-to-trash/content.txt").is_file());
+    }
+    #[gpui_kit::test]
+    fn partial_permanent_failure_refreshes_and_does_not_retry(cx: &mut TestAppContext) {
+        let (temp, handle, view, id) = deletion_fixture(cx, 1080.0);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.delete_operation = |request| {
+                    assert_eq!(request.mode(), DeletionMode::Permanent);
+                    assert_eq!(request.path().file_name().unwrap(), "folder-to-trash");
+                    assert!(request
+                        .path()
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("tree-lens-ui-trash-"));
+                    // Only simulate a partial failure inside this synthetic fixture.
+                    std::fs::remove_file(request.path().join("content.txt")).unwrap();
+                    Err("mock partial failure: 部分项目可能已删除".into())
+                };
+                app.request_delete_mode(id, DeletionMode::Permanent, window, cx);
+            });
+            wait_for_deletion_preparation(&view, window, cx);
+            window.click("delete-confirm", cx);
+            view.update(cx, |app, cx| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.busy() && Instant::now() < deadline {
+                    app.poll_deletion(window, cx);
+                    app.session.poll();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(!app.busy());
+                let scan = app.session.result.as_ref().unwrap();
+                assert_eq!(scan.nodes[scan.root].file_count, 0);
+                assert_eq!(scan.nodes.len(), 2);
+                assert_eq!(app.session.selected, Some(scan.root));
+                assert!(app
+                    .deletion_notice
+                    .as_ref()
+                    .unwrap()
+                    .contains("mock partial failure"));
+                assert!(app.pending_deletion.is_none());
+                app.confirm_delete(window, cx);
+                assert!(app.deletion.is_none());
+            });
+        })
+        .unwrap();
+        assert!(temp.0.join("scan/folder-to-trash").is_dir());
+        assert!(!temp.0.join("scan/folder-to-trash/content.txt").exists());
     }
 }

@@ -28,6 +28,7 @@ use tree_lens::{
     tree::SortBy,
 };
 
+const TREE_ROW_HEIGHT: f32 = 40.0;
 const BG: u32 = 0x0b1017;
 const PANEL: u32 = 0x111923;
 const BORDER: u32 = 0x243241;
@@ -163,18 +164,7 @@ impl TreeLensApp {
                 .update_in(cx, |this, window, cx| {
                     this.poll_deletion_preparation(window, cx);
                     this.poll_deletion(window, cx);
-                    let was_busy = this.session.busy();
-                    let search_pending = this.session.query != this.session.applied_query();
-                    if this.session.poll() {
-                        if was_busy && !this.session.busy() {
-                            this.reset_projection();
-                            this.scroll.scroll_to_item(0, ScrollStrategy::Top);
-                        }
-                        if search_pending {
-                            this.scroll.scroll_to_item(0, ScrollStrategy::Top);
-                        }
-                        cx.notify();
-                    }
+                    this.poll_session(window, cx);
                 })
                 .is_err()
             {
@@ -215,15 +205,30 @@ impl TreeLensApp {
         }
         self.pending_deletion = None;
         self.deletion_notice = None;
-        let _ = self.session.start(path.clone());
+        let retained_view = self.session.result.is_some();
+        if !self.session.start(path.clone()) {
+            if retained_view {
+                if let Some(root) = &self.session.root_path {
+                    self.path_input.update(cx, |input, cx| {
+                        input.set_value(root.display().to_string(), window, cx)
+                    });
+                }
+            }
+            cx.notify();
+            return;
+        }
         self.generation = self.generation.wrapping_add(1);
         self.path_input.update(cx, |input, cx| {
             input.set_value(path.display().to_string(), window, cx)
         });
-        self.search_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.tiles.clear();
-        self.map_parent = None;
+        // A new scan root does not evict the displayed root. Keep its exact
+        // panels and navigation until a complete replacement is accepted.
+        if !retained_view {
+            self.search_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.tiles.clear();
+            self.map_parent = None;
+        }
         cx.notify();
     }
 
@@ -260,6 +265,113 @@ impl TreeLensApp {
         cx.notify();
     }
 
+    /// Reconciliation keeps the same list and panels mounted. Capture navigation
+    /// immediately before applying a worker result, so scrolling, selection and
+    /// map navigation performed while the worker ran are never rolled back.
+    fn poll_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_busy = self.session.busy();
+        let was_replacing = self.session.replacing();
+        let revision = self.session.revision();
+        let reconciling = self.session.reconciling();
+        let applied_query = self.session.applied_query().to_owned();
+        let map_path = reconciling
+            .then(|| {
+                self.map_parent
+                    .and_then(|id| self.session.result.as_ref().map(|scan| scan.path_for(id)))
+            })
+            .flatten();
+        let anchor = reconciling.then(|| self.scroll_anchor()).flatten();
+        if !self.session.poll() {
+            return;
+        }
+        let query_changed = applied_query != self.session.applied_query();
+        if was_busy && !self.session.busy() {
+            let accepted = revision != self.session.revision();
+            if accepted {
+                // Every accepted scan can recycle dense IDs, not only deletion.
+                self.generation = self.generation.wrapping_add(1);
+            }
+            if reconciling {
+                if let Some(scan) = &self.session.result {
+                    let parent = map_path
+                        .as_deref()
+                        .and_then(|path| {
+                            path.ancestors().find_map(|ancestor| {
+                                self.session
+                                    .node_for_path(ancestor)
+                                    .filter(|&id| scan.nodes[id].kind == NodeKind::Directory)
+                            })
+                        })
+                        .unwrap_or(scan.root);
+                    self.map_parent = Some(parent);
+                    self.tiles = footprint::project(scan, parent);
+                }
+                if !query_changed {
+                    if let Some(anchor) = anchor {
+                        self.restore_scroll_anchor(anchor);
+                    }
+                }
+            } else if accepted {
+                self.reset_projection();
+                self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
+                if was_replacing {
+                    self.search_input
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                }
+            }
+            if was_replacing {
+                // On failure/cancellation Session restores the displayed root.
+                // Never leave an editable target path claiming to be the view.
+                if let Some(root) = &self.session.root_path {
+                    self.path_input.update(cx, |input, cx| {
+                        input.set_value(root.display().to_string(), window, cx)
+                    });
+                }
+            }
+        }
+        if query_changed {
+            self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    fn scroll_anchor(&self) -> Option<(PathBuf, usize, Point<Pixels>, Pixels)> {
+        let state = self.scroll.0.borrow();
+        // Respect an explicit user scroll scheduled for the next layout.
+        if state.deferred_scroll_to_item.is_some() {
+            return None;
+        }
+        // GPUI last_item_size.item is the viewport, not one row.
+        let height = px(TREE_ROW_HEIGHT);
+        let offset = state.base_handle.offset();
+        let index = ((-offset.y / height).floor().max(0.0) as usize)
+            .min(self.session.rows.len().saturating_sub(1));
+        let scan = self.session.result.as_ref()?;
+        let (id, _) = self.session.rows.row_at(scan, index)?;
+        Some((scan.path_for(id), index, offset, height))
+    }
+
+    fn restore_scroll_anchor(
+        &self,
+        (path, old_index, offset, height): (PathBuf, usize, Point<Pixels>, Pixels),
+    ) {
+        let Some(scan) = &self.session.result else {
+            return;
+        };
+        // If the top row itself disappeared, retain its nearest row position.
+        // GPUI clamps at the bottom if the list became shorter.
+        let index = self
+            .session
+            .node_for_path(&path)
+            .and_then(|id| self.session.rows.row_index(scan, id))
+            .unwrap_or(old_index.min(self.session.rows.len().saturating_sub(1)));
+        let state = self.scroll.0.borrow();
+        state.base_handle.set_offset(point(
+            offset.x,
+            offset.y + (old_index as f32 - index as f32) * height,
+        ));
+    }
+
     fn reset_projection(&mut self) {
         self.map_parent = self.session.result.as_ref().map(|scan| scan.root);
         self.tiles = self
@@ -273,7 +385,12 @@ impl TreeLensApp {
     fn select_node(&mut self, id: NodeId, cx: &mut Context<Self>) {
         self.session.select(id);
         if let Some(scan) = &self.session.result {
-            if scan.nodes[id].kind == NodeKind::Directory && self.map_parent != Some(id) {
+            if scan
+                .nodes
+                .get(id)
+                .is_some_and(|node| node.kind == NodeKind::Directory)
+                && self.map_parent != Some(id)
+            {
                 self.map_parent = Some(id);
                 self.tiles = footprint::project(scan, id);
             }
@@ -291,6 +408,14 @@ impl TreeLensApp {
     }
 
     fn copy_path(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if !self
+            .session
+            .result
+            .as_ref()
+            .is_some_and(|scan| id < scan.nodes.len())
+        {
+            return;
+        }
         if let Some(scan) = &self.session.result {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 scan.path_for(id).display().to_string(),
@@ -301,6 +426,14 @@ impl TreeLensApp {
     }
 
     fn reveal(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if !self
+            .session
+            .result
+            .as_ref()
+            .is_some_and(|scan| id < scan.nodes.len())
+        {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(scan) = &self.session.result {
             if let Err(error) = std::process::Command::new("/usr/bin/open")
@@ -349,6 +482,7 @@ impl TreeLensApp {
 
     fn deletable_item(&self, id: NodeId, _mode: DeletionMode) -> bool {
         !self.busy()
+            && !self.session.stale()
             && !self.choosing
             && self.session.result.as_ref().is_some_and(|scan| {
                 id != scan.root
@@ -647,45 +781,27 @@ impl TreeLensApp {
         cx.notify();
     }
 
-    fn poll_deletion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn poll_deletion(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let result = match self.deletion.as_ref().map(|receiver| receiver.try_recv()) {
             Some(Ok(result)) => result,
-            Some(Err(mpsc::TryRecvError::Disconnected)) => Err(
-                "删除线程意外结束。请在系统文件管理器中确认项目状态，再刷新；不会自动重试。".into(),
-            ),
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                Err("删除线程意外结束。请在系统文件管理器中确认项目状态；不会自动重试。".into())
+            }
             _ => return,
         };
         self.deletion = None;
         let mode = self.deletion_mode.take().unwrap_or(DeletionMode::Trash);
-        match result {
-            Ok(()) => {
-                // Rebuild all accounting, including hard-link attribution. Never subtract
-                // stale subtree totals or leave a selected ID from the previous scan.
-                if let Some(root) = self.session.root_path.clone() {
-                    self.start(root, window, cx);
-                }
-                self.deletion_notice = Some(match mode {
-                    DeletionMode::Trash => {
-                        format!("已移到{TRASH_NAME}，可在系统{TRASH_NAME}中恢复")
-                    }
-                    DeletionMode::Permanent => "已彻底删除所选项目；此操作不可撤销".into(),
-                });
-            }
-            Err(error) => {
-                let notice = format!("未能确认删除完成：{error} 不会自动重试。");
-                if mode == DeletionMode::Permanent {
-                    // Recursive deletion can fail after removing some entries.
-                    // Always rebuild the projection rather than keep stale totals.
-                    if let Some(root) = self.session.root_path.clone() {
-                        self.start(root, window, cx);
-                    }
-                    self.deletion_notice = Some(notice);
-                } else {
-                    self.deletion_notice = None;
-                    self.session.status = format!("{notice} 请检查后刷新。");
-                }
-            }
-        }
+        self.deletion_notice = Some(match result {
+            Ok(()) => match mode {
+                DeletionMode::Trash => format!("已移到{TRASH_NAME}，可在系统{TRASH_NAME}中恢复"),
+                DeletionMode::Permanent => "已彻底删除所选项目；此操作不可撤销".into(),
+            },
+            Err(error) => format!("未能确认删除完成：{error} 不会自动重试。"),
+        });
+        // All outcomes can have changed disk state, including partial Trash or
+        // permanent failures. Revalidate accounting read-only in the background,
+        // never clear the displayed tree or reuse a stale subtraction estimate.
+        self.session.reconcile();
         cx.notify();
     }
 
@@ -779,6 +895,63 @@ impl TreeLensApp {
             )
     }
 
+    /// Always occupies the existing subtitle line: loading a new root must not
+    /// insert/remove panels or shift the viewport just to show its progress.
+    fn root_context(&self) -> Div {
+        let displayed = self
+            .session
+            .result
+            .as_ref()
+            .map(|scan| format!("当前显示：{}", scan.root_path.display()))
+            .unwrap_or_else(|| "选择文件夹，查看空间占用。".into());
+        let pending = if self.session.replacing() {
+            self.session
+                .root_path
+                .as_ref()
+                .map(|path| format!("正在扫描：{}", path.display()))
+        } else {
+            None
+        };
+        div()
+            .flex()
+            .gap_3()
+            .h(px(20.0))
+            .min_w_0()
+            .text_xs()
+            .child(
+                div()
+                    .id("displayed-root")
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(rgb(MUTED))
+                    .aria_label(displayed.clone())
+                    .tooltip({
+                        let label = displayed.clone();
+                        move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+                    })
+                    .child(displayed),
+            )
+            .when_some(pending, |el, pending| {
+                el.child(
+                    div()
+                        .id("pending-root")
+                        .test_support()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(rgb(AMBER))
+                        .aria_label(pending.clone())
+                        .tooltip({
+                            let label = pending.clone();
+                            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+                        })
+                        .child(pending),
+                )
+            })
+    }
+
     fn toolbar(&self, cx: &mut Context<Self>) -> Div {
         let busy = self.busy();
         div()
@@ -794,6 +967,8 @@ impl TreeLensApp {
                         div()
                             .flex()
                             .flex_col()
+                            .flex_1()
+                            .min_w_0()
                             .gap_1()
                             .child(
                                 div()
@@ -801,12 +976,7 @@ impl TreeLensApp {
                                     .font_weight(FontWeight::BOLD)
                                     .child("让空间，看得见。"),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(MUTED))
-                                    .child("从文件夹到每个字节，找到真正占用空间的地方。"),
-                            ),
+                            .child(self.root_context()),
                     )
                     .child(
                         div()
@@ -950,6 +1120,7 @@ impl TreeLensApp {
                 .as_ref()
                 .map(|scan| (id, scan.nodes[id].display_name().into_owned()))
         });
+        let generation = self.generation;
         let mut chart = div()
             .relative()
             .w_full()
@@ -1009,7 +1180,9 @@ impl TreeLensApp {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(id) = id {
-                            this.select_node(id, cx);
+                            if this.generation == generation {
+                                this.select_node(id, cx);
+                            }
                         }
                     })),
             );
@@ -1280,7 +1453,7 @@ impl TreeLensApp {
             .when(directory, |el| el.aria_expanded(open))
             .flex()
             .items_center()
-            .h(px(40.0))
+            .h(px(TREE_ROW_HEIGHT))
             .px_3()
             .gap_2()
             .border_b_1()
@@ -1289,6 +1462,9 @@ impl TreeLensApp {
             .hover(|style| style.bg(rgb(0x1b2a37)))
             .cursor_pointer()
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if this.generation != generation {
+                    return;
+                }
                 this.select_node(id, cx);
                 if event.click_count() == 2 {
                     this.session.toggle(id);
@@ -1318,6 +1494,9 @@ impl TreeLensApp {
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     cx.stop_propagation();
+                                    if this.generation != generation {
+                                        return;
+                                    }
                                     this.session.toggle(id);
                                     cx.notify();
                                 },
@@ -1510,6 +1689,7 @@ impl TreeLensApp {
     }
 
     fn inspector(&self, cx: &mut Context<Self>) -> Div {
+        let generation = self.generation;
         let mut panel = div()
             .w(px(220.0))
             .flex_shrink_0()
@@ -1593,14 +1773,14 @@ impl TreeLensApp {
                     Button::new("copy-selected")
                         .label("复制路径")
                         .icon(IconName::Copy)
-                        .on_click(cx.listener(move |this, _, _, cx| this.copy_path(id, cx))),
+                        .on_click(cx.listener(move |this, _, _, cx| { if this.generation == generation { this.copy_path(id, cx); } })),
                 )
                 .when(TRASH_SUPPORTED, |panel| {
                     panel.child(
                         Button::new("reveal-selected")
                             .label(platform::REVEAL_LABEL)
                             .icon(IconName::ExternalLink)
-                            .on_click(cx.listener(move |this, _, _, cx| this.reveal(id, cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| { if this.generation == generation { this.reveal(id, cx); } })),
                     )
                 })
                 .when(
@@ -1622,7 +1802,7 @@ impl TreeLensApp {
                                     "确认后将所选项目移到系统回收站/废纸篓，不永久删除。"
                                 })
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.request_delete(id, window, cx);
+                                    if this.generation == generation { this.request_delete(id, window, cx); }
                                 })),
                         )
                     },
@@ -1638,7 +1818,7 @@ impl TreeLensApp {
                             )
                             .tooltip("单独确认后彻底删除所选项目及文件夹全部内容，不进入回收站/废纸篓，无法撤销。")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.request_delete_mode(id, DeletionMode::Permanent, window, cx);
+                                if this.generation == generation { this.request_delete_mode(id, DeletionMode::Permanent, window, cx); }
                             })),
                     )
                 });
@@ -1665,6 +1845,14 @@ impl TreeLensApp {
             match self.deletion_mode {
                 Some(DeletionMode::Permanent) => "正在彻底删除…请勿移动或重命名。".into(),
                 _ => format!("正在移到{TRASH_NAME}…请勿移动或重命名此项目。"),
+            }
+        } else if self.session.reconciling() {
+            "正在后台核对列表与大小，保留当前位置…".into()
+        } else if self.session.replacing() {
+            if self.session.cancelling() {
+                "正在取消新目录扫描，当前视图保持不变…".into()
+            } else {
+                "正在扫描新目录，列表和统计仍显示原目录；完成后一次性切换。".into()
             }
         } else if self.session.busy() {
             format!(
@@ -1951,11 +2139,12 @@ mod ui_tests {
     use gpui_kit::component::WindowExt;
     use gpui_kit::test::{TestQueryExt, TestWindowExt};
     use gpui_kit::{
-        px, size, AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, WindowBounds,
+        point, px, size, AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, WindowBounds,
         WindowOptions,
     };
     use std::{
         path::PathBuf,
+        sync::mpsc,
         time::{Duration, Instant},
     };
     use tree_lens::{deletion::DeletionMode, scanner::NodeKind, tree::SortBy};
@@ -1987,7 +2176,7 @@ mod ui_tests {
                         if loaded {
                             let deadline = Instant::now() + Duration::from_secs(5);
                             while app.session.busy() && Instant::now() < deadline {
-                                app.session.poll();
+                                app.poll_session(window, cx);
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                             assert!(!app.session.busy());
@@ -2142,7 +2331,7 @@ mod ui_tests {
                     app.start(temp.0.join("scan"), window, cx);
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while app.session.busy() && Instant::now() < deadline {
-                        app.session.poll();
+                        app.poll_session(window, cx);
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     assert!(!app.session.busy());
@@ -2235,7 +2424,7 @@ mod ui_tests {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while app.busy() && Instant::now() < deadline {
                     app.poll_deletion(window, cx);
-                    app.session.poll();
+                    app.poll_session(window, cx);
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 assert!(!app.busy());
@@ -2262,12 +2451,17 @@ mod ui_tests {
             window.click("delete-confirm", cx);
             view.update(cx, |app, cx| {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while app.deletion.is_some() && Instant::now() < deadline {
+                while app.busy() && Instant::now() < deadline {
                     app.poll_deletion(window, cx);
+                    app.poll_session(window, cx);
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 assert!(!app.busy());
-                assert!(app.session.status.contains("mock permission denied"));
+                assert!(app
+                    .deletion_notice
+                    .as_ref()
+                    .unwrap()
+                    .contains("mock permission denied"));
                 assert_eq!(app.session.selected, Some(id));
                 assert!(app.deletable_item(id, DeletionMode::Trash));
                 app.request_delete(id, window, cx);
@@ -2475,12 +2669,15 @@ mod ui_tests {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while app.busy() && Instant::now() < deadline {
                     app.poll_deletion(window, cx);
-                    app.session.poll();
+                    app.poll_session(window, cx);
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 assert!(!app.busy());
                 let scan = app.session.result.as_ref().unwrap();
-                assert_eq!(app.session.selected, Some(scan.root));
+                assert_eq!(
+                    scan.path_for(app.session.selected.unwrap()),
+                    temp.0.join("scan/folder-to-trash")
+                );
                 assert_eq!(scan.nodes[scan.root].file_count, 0);
                 assert!(app.deletion_notice.as_ref().unwrap().contains("已彻底删除"));
             });
@@ -2504,12 +2701,16 @@ mod ui_tests {
             window.click("delete-confirm", cx);
             view.update(cx, |app, cx| {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while app.deletion.is_some() && Instant::now() < deadline {
+                while app.busy() && Instant::now() < deadline {
                     app.poll_deletion(window, cx);
+                    app.poll_session(window, cx);
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                assert!(app.session.status.contains("mock trash unavailable"));
-                assert!(app.deletion_notice.is_none());
+                assert!(app
+                    .deletion_notice
+                    .as_ref()
+                    .unwrap()
+                    .contains("mock trash unavailable"));
                 assert_eq!(app.session.selected, Some(id));
                 app.request_delete_mode(id, DeletionMode::Permanent, window, cx);
                 assert_eq!(
@@ -2535,13 +2736,16 @@ mod ui_tests {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while app.busy() && Instant::now() < deadline {
                     app.poll_deletion(window, cx);
-                    app.session.poll();
+                    app.poll_session(window, cx);
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 assert!(!app.busy());
                 let scan = app.session.result.as_ref().unwrap();
                 assert_eq!(scan.nodes[scan.root].file_count, 0);
-                assert_eq!(app.session.selected, Some(scan.root));
+                assert_eq!(
+                    scan.path_for(app.session.selected.unwrap()),
+                    temp.0.join("scan/folder-to-trash")
+                );
                 assert!(app.deletion_notice.as_ref().unwrap().contains(TRASH_NAME));
             });
         })
@@ -2598,7 +2802,7 @@ mod ui_tests {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while app.busy() && Instant::now() < deadline {
                     app.poll_deletion(window, cx);
-                    app.session.poll();
+                    app.poll_session(window, cx);
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 assert!(!app.busy());
@@ -2650,6 +2854,330 @@ mod ui_tests {
         assert!(temp.0.join("scan/folder-to-trash/content.txt").is_file());
     }
     #[gpui_kit::test]
+    fn deletion_keeps_list_mounted_and_preserves_viewport_and_navigation(cx: &mut TestAppContext) {
+        for query in ["", "entry"] {
+            let (temp, handle, view, _) = deletion_fixture(cx, 1440.0);
+            let folder = temp.0.join("scan/folder-to-trash");
+            for index in 0..80 {
+                std::fs::write(folder.join(format!("entry-{index:03}.txt")), b"fixture").unwrap();
+            }
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let (anchor_before, rows_before, generation) = cx
+                .update_window(handle, |_, window, cx| {
+                    view.update(cx, |app, cx| {
+                        app.start(temp.0.join("scan"), window, cx);
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while app.busy() && Instant::now() < deadline {
+                            app.poll_session(window, cx);
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        assert!(!app.busy());
+                        app.session.sort_by(SortBy::Name);
+                        app.session.expand_one_level();
+                        let directory = app.session.node_for_path(&folder).unwrap();
+                        app.select_node(directory, cx);
+                        let selected = app
+                            .session
+                            .node_for_path(&folder.join("entry-060.txt"))
+                            .unwrap();
+                        app.select_node(selected, cx);
+                        app.search_input
+                            .update(cx, |input, cx| input.set_value(query, window, cx));
+                        app.session.set_query(query.into());
+                        std::thread::sleep(Duration::from_millis(190));
+                        app.poll_session(window, cx);
+                    });
+                    window.render_frame(cx);
+                    view.update(cx, |app, _| {
+                        let state = app.scroll.0.borrow();
+                        state
+                            .base_handle
+                            .set_offset(point(px(0.0), -px(40.0) * 40.0 - px(7.0)));
+                    });
+                    window.render_frame(cx);
+                    let before = view.update(cx, |app, _| {
+                        let anchor = app.scroll_anchor().unwrap();
+                        assert_eq!(anchor.1, 40, "anchor uses row height, not viewport height");
+                        app.deletion = Some(receiver);
+                        app.deletion_mode = Some(DeletionMode::Trash);
+                        (anchor, app.session.rows.len(), app.generation)
+                    });
+                    window.render_frame(cx);
+                    assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
+                    assert!(window.find("map-root").visible());
+                    assert_eq!(view.read(cx).session.rows.len(), before.1);
+                    before
+                })
+                .unwrap();
+            // Only change this test's own synthetic file, not the OS Trash.
+            std::fs::remove_file(folder.join("content.txt")).unwrap();
+            sender.send(Ok(())).unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| app.poll_deletion(window, cx));
+                assert!(view.read(cx).session.reconciling());
+                assert_eq!(view.read(cx).session.rows.len(), rows_before);
+                window.render_frame(cx);
+                assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
+                assert!(window.find("map-root").visible());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while view.read(cx).busy() && Instant::now() < deadline {
+                    view.update(cx, |app, cx| app.poll_session(window, cx));
+                    window.render_frame(cx);
+                    assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
+                    assert!(window.find("map-root").visible());
+                    assert!(view.read(cx).session.result.is_some());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let app = view.read(cx);
+                assert!(!app.busy());
+                let scan = app.session.result.as_ref().unwrap();
+                assert_eq!(scan.nodes[scan.root].file_count, 80);
+                assert_eq!(
+                    scan.path_for(app.session.selected.unwrap()),
+                    folder.join("entry-060.txt")
+                );
+                let directory = app.session.node_for_path(&folder).unwrap();
+                assert_eq!(app.map_parent, Some(directory));
+                assert!(app.session.expanded.contains(&directory));
+                assert_eq!(app.session.sort, SortBy::Name);
+                assert_eq!(app.session.query, query);
+                assert_eq!(app.search_input.read(cx).value().as_ref(), query);
+                assert_eq!(app.generation, generation.wrapping_add(1));
+                let after = app.scroll_anchor().unwrap();
+                assert_eq!(after.0, anchor_before.0, "same top pathname");
+                assert_eq!(
+                    after.2.y + after.1 as f32 * after.3,
+                    anchor_before.2.y + anchor_before.1 as f32 * anchor_before.3,
+                    "same fractional pixel offset"
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn first_scan_keeps_search_typed_while_worker_is_running(cx: &mut TestAppContext) {
+        let temp = TrashFixture::new();
+        let (handle, view) = fixture(cx, 1080.0, false);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.start(temp.0.join("scan"), window, cx);
+                assert!(!app.session.replacing());
+                app.search_input
+                    .update(cx, |input, cx| input.set_value("content", window, cx));
+                app.session.set_query("content".into());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.busy() && Instant::now() < deadline {
+                    app.poll_session(window, cx);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(!app.busy());
+                assert_eq!(app.search_input.read(cx).value().as_ref(), "content");
+                assert_eq!(app.session.query, "content");
+                std::thread::sleep(Duration::from_millis(190));
+                app.poll_session(window, cx);
+                assert_eq!(app.session.applied_query(), "content");
+                assert_eq!(app.session.rows.len(), 3);
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn switching_scan_roots_keeps_panels_until_atomic_success_or_retains_on_failure(
+        cx: &mut TestAppContext,
+    ) {
+        for outcome in ["success", "error", "cancel"] {
+            let (temp, handle, view, _) = deletion_fixture(cx, 1440.0);
+            let old_root = temp.0.join("scan");
+            let old_folder = old_root.join("folder-to-trash");
+            for index in 0..60 {
+                std::fs::write(old_folder.join(format!("entry-{index:03}.txt")), b"fixture")
+                    .unwrap();
+            }
+            let new_root = temp.0.join("new-root");
+            if outcome != "error" {
+                std::fs::create_dir(&new_root).unwrap();
+                std::fs::write(new_root.join("replacement-only.txt"), b"new fixture").unwrap();
+            }
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| {
+                    app.start(old_root.clone(), window, cx);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while app.busy() && Instant::now() < deadline {
+                        app.poll_session(window, cx);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(!app.busy());
+                    app.session.sort_by(SortBy::Name);
+                    app.session.expand_one_level();
+                    let folder = app.session.node_for_path(&old_folder).unwrap();
+                    app.select_node(folder, cx);
+                    let selected = app
+                        .session
+                        .node_for_path(&old_folder.join("entry-040.txt"))
+                        .unwrap();
+                    app.select_node(selected, cx);
+                    app.search_input
+                        .update(cx, |input, cx| input.set_value("entry", window, cx));
+                    app.session.set_query("entry".into());
+                    std::thread::sleep(Duration::from_millis(190));
+                    app.poll_session(window, cx);
+                });
+                window.render_frame(cx);
+                view.update(cx, |app, _| {
+                    app.scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .set_offset(point(px(0.0), -px(503.0)));
+                });
+                window.render_frame(cx);
+                let map_bounds = window.find("map-root").bounds();
+                let (generation, revision, summary, selected, expanded, map_parent, scroll) = {
+                    let app = view.read(cx);
+                    (
+                        app.generation,
+                        app.session.revision(),
+                        app.session.summary(),
+                        app.session.selected,
+                        app.session.expanded.clone(),
+                        app.map_parent,
+                        app.scroll.0.borrow().base_handle.offset(),
+                    )
+                };
+                view.update(cx, |app, cx| {
+                    app.start(new_root.clone(), window, cx);
+                    assert!(app.session.replacing());
+                    assert_eq!(app.session.result.as_ref().unwrap().root_path, old_root);
+                    assert_eq!(app.session.summary(), summary);
+                    assert_eq!(app.session.selected, selected);
+                    assert_eq!(app.session.expanded, expanded);
+                    assert_eq!(app.map_parent, map_parent);
+                    assert_eq!(app.session.query, "entry");
+                    assert!(!app.deletable_item(selected.unwrap(), DeletionMode::Permanent));
+                    app.request_delete(selected.unwrap(), window, cx);
+                    assert!(app.pending_deletion.is_none());
+                    app.start(temp.0.join("another-root"), window, cx);
+                    assert_eq!(
+                        app.session.root_path,
+                        Some(new_root.clone()),
+                        "busy start is ignored"
+                    );
+                    assert_eq!(app.generation, generation.wrapping_add(1));
+                });
+                window.render_frame(cx);
+                assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
+                assert_eq!(
+                    window.find("map-root").bounds(),
+                    map_bounds,
+                    "no loading layout shift"
+                );
+                assert!(window
+                    .find_by_label(&format!("当前显示：{}", old_root.display()))
+                    .visible());
+                assert!(window
+                    .find_by_label(&format!("正在扫描：{}", new_root.display()))
+                    .visible());
+                if outcome == "cancel" {
+                    view.update(cx, |app, _| app.session.cancel());
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while view.read(cx).busy() && Instant::now() < deadline {
+                    view.update(cx, |app, cx| app.poll_session(window, cx));
+                    window.render_frame(cx);
+                    assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
+                    assert_eq!(window.find("map-root").bounds(), map_bounds);
+                    assert!(view.read(cx).session.result.is_some());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let app = view.read(cx);
+                assert!(!app.busy());
+                if outcome == "success" {
+                    let scan = app.session.result.as_ref().unwrap();
+                    assert_eq!(scan.root_path, new_root);
+                    assert_eq!(app.session.revision(), revision.wrapping_add(1));
+                    assert_eq!(app.generation, generation.wrapping_add(2));
+                    assert_eq!(app.session.selected, Some(scan.root));
+                    assert_eq!(app.map_parent, Some(scan.root));
+                    assert_eq!(app.session.summary().2, 1);
+                    assert!(app.session.query.is_empty());
+                    assert!(app.search_input.read(cx).value().is_empty());
+                    assert_eq!(app.scroll.0.borrow().base_handle.offset().y, px(0.0));
+                    assert_eq!(
+                        app.path_input.read(cx).value().as_ref(),
+                        new_root.to_str().unwrap()
+                    );
+                } else {
+                    assert_eq!(app.session.result.as_ref().unwrap().root_path, old_root);
+                    assert_eq!(app.session.root_path, Some(old_root.clone()));
+                    assert_eq!(app.session.revision(), revision);
+                    assert_eq!(app.session.summary(), summary);
+                    assert_eq!(app.session.selected, selected);
+                    assert_eq!(app.session.expanded, expanded);
+                    assert_eq!(app.map_parent, map_parent);
+                    assert_eq!(app.session.query, "entry");
+                    assert_eq!(app.search_input.read(cx).value().as_ref(), "entry");
+                    assert_eq!(app.scroll.0.borrow().base_handle.offset(), scroll);
+                    assert_eq!(
+                        app.path_input.read(cx).value().as_ref(),
+                        old_root.to_str().unwrap()
+                    );
+                    assert!(app.session.status.contains("保留"));
+                    assert!(app.deletable_item(selected.unwrap(), DeletionMode::Trash));
+                }
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn uncertain_deletion_reconciles_without_retry_or_empty_frame(cx: &mut TestAppContext) {
+        for disconnect in [false, true] {
+            let (temp, handle, view, id) = file_fixture(cx, 1080.0);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, _| {
+                    app.deletion = Some(receiver);
+                    app.deletion_mode = Some(DeletionMode::Trash);
+                    assert_eq!(app.session.selected, Some(id));
+                });
+                // A Trash API can report error/disconnect after changing disk.
+                // Revalidate every outcome, but never retry the deletion.
+                std::fs::remove_file(temp.0.join("scan/folder-to-trash/content.txt")).unwrap();
+                if !disconnect {
+                    sender.send(Err("mock uncertain outcome".into())).unwrap();
+                }
+                drop(sender);
+                view.update(cx, |app, cx| app.poll_deletion(window, cx));
+                assert!(view.read(cx).session.reconciling());
+                window.render_frame(cx);
+                assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
+                assert!(window.find("map-root").visible());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while view.read(cx).busy() && Instant::now() < deadline {
+                    view.update(cx, |app, cx| app.poll_session(window, cx));
+                    window.render_frame(cx);
+                    assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
+                    assert!(window.find("map-root").visible());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let app = view.read(cx);
+                assert!(!app.busy());
+                assert_eq!(app.session.summary().2, 0);
+                assert!(app
+                    .deletion_notice
+                    .as_ref()
+                    .unwrap()
+                    .contains("不会自动重试"));
+                assert!(app.pending_deletion.is_none());
+                assert!(app.deletion.is_none());
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
     fn partial_permanent_failure_refreshes_and_does_not_retry(cx: &mut TestAppContext) {
         let (temp, handle, view, id) = deletion_fixture(cx, 1080.0);
         cx.update_window(handle, |_, window, cx| {
@@ -2679,14 +3207,17 @@ mod ui_tests {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while app.busy() && Instant::now() < deadline {
                     app.poll_deletion(window, cx);
-                    app.session.poll();
+                    app.poll_session(window, cx);
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 assert!(!app.busy());
                 let scan = app.session.result.as_ref().unwrap();
                 assert_eq!(scan.nodes[scan.root].file_count, 0);
                 assert_eq!(scan.nodes.len(), 2);
-                assert_eq!(app.session.selected, Some(scan.root));
+                assert_eq!(
+                    scan.path_for(app.session.selected.unwrap()),
+                    temp.0.join("scan/folder-to-trash")
+                );
                 assert!(app
                     .deletion_notice
                     .as_ref()

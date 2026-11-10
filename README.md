@@ -1,8 +1,8 @@
-# Tree Lens 0.5.1 · macOS + Windows + Debian / Ubuntu
+# Tree Lens 0.5.3 · macOS + Windows + Debian / Ubuntu
 
-Rust 编写的原生磁盘空间分析工具。0.5.1 为文件和文件夹新增「移到回收站 / 废纸篓」和「彻底删除」两个独立操作，均需单独确认。0.5 新增 Debian / Ubuntu Linux 桌面支持：X11 / Wayland 原生 GPUI 窗口、桌面门户目录选择器、本地化 XDG 文件夹快捷入口、文件管理器打开和需要确认的 FreeDesktop 回收站操作。保留 0.4 的 Windows x64 支持和 macOS 功能，继续使用 GPUI Kit 0.9.0，不是网页套壳。
+Rust 编写的原生磁盘空间分析工具。0.5.3 同时修复切换扫描目录时的整页加载闪动：新扫描完成前保留旧目录视图，明确标注当前显示与正在扫描的目录，失败或取消不丢失旧状态。0.5.2 修复删除后的整页重置：保留列表、展开、筛选、选择、地图目录和滚动位置，后台核对完成后一次性更新。0.5.1 为文件和文件夹新增「移到回收站 / 废纸篓」和「彻底删除」两个独立操作，均需单独确认。0.5 新增 Debian / Ubuntu Linux 桌面支持：X11 / Wayland 原生 GPUI 窗口、桌面门户目录选择器、本地化 XDG 文件夹快捷入口、文件管理器打开和需要确认的 FreeDesktop 回收站操作。保留 0.4 的 Windows x64 支持和 macOS 功能，继续使用 GPUI Kit 0.9.0，不是网页套壳。
 
-> **验证状态：本次基于已合并 Windows 支持的 main `080f18a` 开发。Debian 13 本地验证与尚未执行的发行版/桌面验收详见 [TESTING.md](TESTING.md)。已添加 Debian 12/13 和 Ubuntu 22.04/24.04 CI，但配置不等于 CI 已通过。没有发布签名安装包。**
+> **验证状态：0.5.3 包含删除和切换扫描目录的保留视图修复，基于 PR #3 合并后的 main `d59da74e`。Linux 核心/GPUI 测试和 Windows/macOS 核心跨目标检查已通过；没有执行原生 Windows GUI 或生成 Windows 安装包。详见 [切换目录修复验证](TESTING-root-switch.md)。**
 
 ## 新界面
 

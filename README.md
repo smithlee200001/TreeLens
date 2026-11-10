@@ -2,7 +2,7 @@
 
 Rust 编写的原生磁盘空间分析工具。0.5.3 同时修复切换扫描目录时的整页加载闪动：新扫描完成前保留旧目录视图，明确标注当前显示与正在扫描的目录，失败或取消不丢失旧状态。0.5.2 修复删除后的整页重置：保留列表、展开、筛选、选择、地图目录和滚动位置，后台核对完成后一次性更新。0.5.1 为文件和文件夹新增「移到回收站 / 废纸篓」和「彻底删除」两个独立操作，均需单独确认。0.5 新增 Debian / Ubuntu Linux 桌面支持：X11 / Wayland 原生 GPUI 窗口、桌面门户目录选择器、本地化 XDG 文件夹快捷入口、文件管理器打开和需要确认的 FreeDesktop 回收站操作。保留 0.4 的 Windows x64 支持和 macOS 功能，继续使用 GPUI Kit 0.9.0，不是网页套壳。
 
-> **验证状态：0.5.3 包含删除和切换扫描目录的保留视图修复，基于 PR #3 合并后的 main `d59da74e`。Linux 核心/GPUI 测试和 Windows/macOS 核心跨目标检查已通过；没有执行原生 Windows GUI 或生成 Windows 安装包。详见 [切换目录修复验证](TESTING-root-switch.md)。**
+> **本包为架构重构源码，基于已合并 PR #4 的 main `231aa923`，保留 0.5.3 行为。采用按功能划分 + 平台适配层，未发布新版本。结构见 [架构说明](docs/ARCHITECTURE.md)，本次验证见 [重构验证记录](TESTING-architecture.md)。**
 
 ## 新界面
 
@@ -60,7 +60,7 @@ Windows 快捷键：`Ctrl+O` 选择目录、`Ctrl+R` 刷新、`Ctrl+F` 筛选、
 1. 扫描文件所在目录，等待扫描结束。
 2. 选中文件或文件夹，宽窗口右侧详情栏提供 **移到回收站 / 废纸篓…** 和 **彻底删除…**。任意窗口宽度都可以右键文件或文件夹使用这两个选项。
 3. 核对确认框中的完整路径，再点击对应的确认按钮。**彻底删除（不可撤销）** 是独立操作，不会进入回收站，无法通过本应用或回收站恢复。取消、Esc 或关闭确认框不会删除；单按 Enter 不会默认确认。
-4. 成功后自动重新扫描，清除筛选和旧选择，回到根目录并更新统计与空间地图。
+4. 操作结束后保留当前列表、展开、筛选和滚动位置，后台只读核对完成后一次性更新统计与空间地图；已删除的选择退回最近保留的上级。核对失败会标记旧视图过期，不自动重试删除。
 
 文件夹也支持两种方式。彻底删除文件夹前会在后台核对全部子项目，按 Esc 可取消准备；确认框明确提示全部内容将被递归删除。要删除文件夹，请扫描其父目录；本次扫描根目录不能删除。
 
@@ -138,14 +138,16 @@ cargo run --locked --no-default-features --example scan -- src
 
 ## 结构与来源
 
-- `src/main.rs`：GPUI Kit 启动、原生窗口、主题与生命周期。
-- `src/app.rs`：GPUI Kit 界面、系统选择器、虚拟列表、菜单和对话框。
-- `src/session.rs`：独立 GUI 的扫描会话、取消、进度与筛选。
-- `src/deletion.rs`：文件/目录身份验证、绑定操作类型的单次确认请求、跨平台回收后端和经内容快照复核的彻底删除。
-- `src/footprint.rs`：有界面积图投影、布局测试。
-- `src/scanner.rs` / `src/tree.rs`：跨平台扫描及低内存虚拟树。
-- `src/windows_fs.rs` / `src/linux_fs.rs` / `src/platform.rs`：平台元数据、Linux 挂载表、系统文件夹路径和平台文案。
-- `scripts/bundle-macos.sh` / `scripts/bundle-windows.ps1` / `scripts/bundle-linux.sh`：本地 `.app` / Windows ZIP / Linux `.deb` 与 tar.gz；`.github/workflows/`：平台检查。
+- `src/main.rs` / `src/ui/`：应用启动、视图、交互控制、主题和 GPUI 测试。
+- `src/features/scan/`：扫描模型和平台无关的迭代扫描流程。
+- `src/features/delete/`：单次确认、身份复核、永久删除内容快照和执行流程。
+- `src/features/explorer/`：保留视图的扫描会话、虚拟树索引和空间地图。
+- `src/platform/`：本机扫描/删除适配、Linux 挂载表、Windows 元数据、系统目录和桌面集成。
+- `src/lib.rs`：新模块入口，以及 `scanner` / `deletion` / `session` / `tree` / `footprint` 的旧 API 兼容导出。
+- `tests/architecture.rs`：依赖方向与旧公开接口兼容检查。
+- `scripts/` / `.github/workflows/`：沿用 macOS、Windows、Debian/Ubuntu 打包和 CI。
+
+详细边界、调用流程与平台扩展方法见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 采用 Longbridge 的 [GPUI Kit](https://github.com/longbridge/gpui-kit)，核对了 crates.io 发布的 0.9.0 源码及其 GPUI 0.3.11 API。官方入口是 `gpui_kit::*` 和 `gpui_kit::component`，不是另一个同名库。参考：[开始使用](https://gpui-kit.com/docs/getting-started/)、[任务与后台执行](https://gpui-kit.com/docs/task/)。第三方软件保留各自许可证。
 

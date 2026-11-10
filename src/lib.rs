@@ -1,13 +1,13 @@
-pub mod deletion;
-pub mod footprint;
-#[cfg(target_os = "linux")]
-mod linux_fs;
+//! Tree Lens: feature-oriented core with compile-time native platform adapters.
+pub mod features;
 pub mod platform;
-pub mod scanner;
-pub mod session;
-pub mod tree;
-#[cfg(windows)]
-mod windows_fs;
+#[cfg(feature = "gui")]
+pub mod ui;
+
+// Compatibility reexports: existing clients keep their module paths and type identity.
+pub use features::delete as deletion;
+pub use features::explorer::{footprint, session, tree};
+pub use features::scan as scanner;
 
 /// Binary units: the app never labels powers of 1024 as decimal MB/GB.
 pub fn format_bytes(bytes: u64) -> String {

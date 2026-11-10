@@ -1,5 +1,5 @@
 //! Bounded, read-only treemap projection. Never duplicates the scan or all children.
-use crate::scanner::{NodeId, ScanOutcome};
+use crate::features::scan::{NodeId, ScanOutcome};
 
 #[derive(Debug, Clone)]
 pub struct Tile {

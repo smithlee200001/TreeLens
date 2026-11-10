@@ -6,6 +6,8 @@ mod flicker_tests;
 #[cfg(all(test, feature = "ui-tests"))]
 mod inspector_tests;
 #[cfg(all(test, feature = "ui-tests"))]
+mod switch_capture;
+#[cfg(all(test, feature = "ui-tests"))]
 mod tests;
 mod theme;
 
@@ -87,7 +89,7 @@ pub struct TreeLensApp {
 
 impl TreeLensApp {
     fn sidebar(&self, cx: &mut Context<Self>) -> Div {
-        let busy = self.busy() || self.choosing;
+        let busy = self.navigation_blocked() || self.choosing;
         let mut nav = div()
             .flex()
             .flex_col()
@@ -182,62 +184,40 @@ impl TreeLensApp {
     /// Always occupies the existing subtitle line: loading a new root must not
     /// insert/remove panels or shift the viewport just to show its progress.
     fn root_context(&self) -> Div {
-        let displayed = self
-            .session
-            .result
-            .as_ref()
-            .map(|scan| format!("当前显示：{}", scan.root_path.display()))
-            .unwrap_or_else(|| "选择文件夹，查看空间占用。".into());
-        let pending = if self.session.replacing() {
+        let displayed = if self.session.busy() && !self.session.reconciling() {
             self.session
                 .root_path
                 .as_ref()
                 .map(|path| format!("正在扫描：{}", path.display()))
+        } else if let Some(scan) = &self.session.result {
+            Some(format!("当前显示：{}", scan.root_path.display()))
         } else {
-            None
-        };
-        div()
-            .flex()
-            .gap_3()
-            .h(px(20.0))
-            .min_w_0()
-            .text_xs()
-            .child(
-                div()
-                    .id("displayed-root")
-                    .test_support()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(rgb(MUTED))
-                    .aria_label(displayed.clone())
-                    .tooltip({
-                        let label = displayed.clone();
-                        move |window, cx| Tooltip::new(label.clone()).build(window, cx)
-                    })
-                    .child(displayed),
-            )
-            .when_some(pending, |el, pending| {
-                el.child(
-                    div()
-                        .id("pending-root")
-                        .test_support()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(rgb(AMBER))
-                        .aria_label(pending.clone())
-                        .tooltip({
-                            let label = pending.clone();
-                            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
-                        })
-                        .child(pending),
-                )
-            })
+            self.session
+                .root_path
+                .as_ref()
+                .map(|path| format!("当前目录：{}", path.display()))
+        }
+        .unwrap_or_else(|| "选择文件夹，查看空间占用。".into());
+        div().flex().gap_3().h(px(20.0)).min_w_0().text_xs().child(
+            div()
+                .id("displayed-root")
+                .test_support()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(rgb(MUTED))
+                .aria_label(displayed.clone())
+                .tooltip({
+                    let label = displayed.clone();
+                    move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+                })
+                .child(displayed),
+        )
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> Div {
         let busy = self.busy();
+        let navigation_blocked = self.navigation_blocked() || self.choosing;
         div()
             .flex()
             .flex_col()
@@ -284,8 +264,8 @@ impl TreeLensApp {
                             .primary()
                             .icon(IconName::FolderOpen)
                             .label("选择文件夹")
-                            .disabled(busy || self.choosing)
-                            .when(busy || self.choosing, |button| {
+                            .disabled(navigation_blocked)
+                            .when(navigation_blocked, |button| {
                                 button
                                     .text_color(rgb(0x092322))
                                     .bg(rgb(CYAN))
@@ -299,17 +279,17 @@ impl TreeLensApp {
                     .child(
                         div().flex_1().min_w_0().child(
                             Input::new(&self.path_input)
-                                // Read-only keeps path text/copying stable;
-                                // start() still rejects Enter while busy.
-                                .readonly(busy)
+                                // Read-only keeps text/copying stable during deletion;
+                                // ordinary scans can be replaced by a new path.
+                                .readonly(navigation_blocked)
                                 .aria_label("扫描文件夹路径"),
                         ),
                     )
                     .child(
                         Button::new("scan-path")
                             .label("扫描")
-                            .disabled(busy)
-                            .when(busy, stable_navigation_button)
+                            .disabled(navigation_blocked)
+                            .when(navigation_blocked, stable_navigation_button)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let path = this.path_input.read(cx).value().to_string();
                                 if !path.trim().is_empty() {
@@ -1179,12 +1159,6 @@ impl TreeLensApp {
             }
         } else if self.session.reconciling() {
             "正在后台核对列表与大小，保留当前位置…".into()
-        } else if self.session.replacing() {
-            if self.session.cancelling() {
-                "正在取消新目录扫描，当前视图保持不变…".into()
-            } else {
-                "正在扫描新目录，列表和统计仍显示原目录；完成后一次性切换。".into()
-            }
         } else if self.session.busy() {
             format!(
                 "已检查 {} 个项目 · {}",

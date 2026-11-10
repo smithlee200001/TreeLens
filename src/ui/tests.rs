@@ -142,9 +142,9 @@ fn hundred_thousand_nodes_only_render_a_viewport(cx: &mut TestAppContext) {
     .unwrap();
 }
 
-struct TrashFixture(PathBuf);
+pub(super) struct TrashFixture(pub(super) PathBuf);
 impl TrashFixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         // Wall-clock resolution varies by OS. Parallel tests must never
         // share a directory, even when they observe the same timestamp.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -845,7 +845,6 @@ fn first_scan_keeps_search_typed_while_worker_is_running(cx: &mut TestAppContext
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |app, cx| {
             app.start(temp.0.join("scan"), window, cx);
-            assert!(!app.session.replacing());
             app.search_input
                 .update(cx, |input, cx| input.set_value("content", window, cx));
             app.session.set_query("content".into());
@@ -867,150 +866,129 @@ fn first_scan_keeps_search_typed_while_worker_is_running(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
-fn switching_scan_roots_keeps_panels_until_atomic_success_or_retains_on_failure(
-    cx: &mut TestAppContext,
-) {
-    for outcome in ["success", "error", "cancel"] {
-        let (temp, handle, view, _) = deletion_fixture(cx, 1440.0);
+fn switching_scan_roots_immediately_shows_requested_root(cx: &mut TestAppContext) {
+    for outcome in ["success", "error", "cancel", "newer-root"] {
+        let (temp, handle, view, old_selected) = deletion_fixture(cx, 1440.0);
         let old_root = temp.0.join("scan");
-        let old_folder = old_root.join("folder-to-trash");
-        for index in 0..60 {
-            std::fs::write(old_folder.join(format!("entry-{index:03}.txt")), b"fixture").unwrap();
-        }
         let new_root = temp.0.join("new-root");
+        let latest_root = temp.0.join("latest-root");
         if outcome != "error" {
             std::fs::create_dir(&new_root).unwrap();
             std::fs::write(new_root.join("replacement-only.txt"), b"new fixture").unwrap();
         }
+        std::fs::create_dir(&latest_root).unwrap();
         cx.update_window(handle, |_, window, cx| {
             view.update(cx, |app, cx| {
-                app.start(old_root.clone(), window, cx);
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while app.busy() && Instant::now() < deadline {
-                    app.poll_session(window, cx);
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                assert!(!app.busy());
-                app.session.sort_by(SortBy::Name);
-                app.session.expand_one_level();
-                let folder = app.session.node_for_path(&old_folder).unwrap();
-                app.select_node(folder, cx);
-                let selected = app
-                    .session
-                    .node_for_path(&old_folder.join("entry-040.txt"))
-                    .unwrap();
-                app.select_node(selected, cx);
                 app.search_input
-                    .update(cx, |input, cx| input.set_value("entry", window, cx));
-                app.session.set_query("entry".into());
-                std::thread::sleep(Duration::from_millis(190));
-                app.poll_session(window, cx);
-            });
-            window.render_frame(cx);
-            view.update(cx, |app, _| {
-                app.scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .set_offset(point(px(0.0), -px(503.0)));
-            });
-            window.render_frame(cx);
-            let map_bounds = window.find("map-root").bounds();
-            let (generation, revision, summary, selected, expanded, map_parent, scroll) = {
-                let app = view.read(cx);
-                (
-                    app.generation,
-                    app.session.revision(),
-                    app.session.summary(),
-                    app.session.selected,
-                    app.session.expanded.clone(),
-                    app.map_parent,
-                    app.scroll.0.borrow().base_handle.offset(),
-                )
-            };
-            view.update(cx, |app, cx| {
+                    .update(cx, |input, cx| input.set_value("old", window, cx));
+                app.session.set_query("old".into());
                 app.start(new_root.clone(), window, cx);
-                assert!(app.session.replacing());
-                assert_eq!(app.session.result.as_ref().unwrap().root_path, old_root);
-                assert_eq!(app.session.summary(), summary);
-                assert_eq!(app.session.selected, selected);
-                assert_eq!(app.session.expanded, expanded);
-                assert_eq!(app.map_parent, map_parent);
-                assert_eq!(app.session.query, "entry");
-                assert!(!app.deletable_item(selected.unwrap(), DeletionMode::Permanent));
-                app.request_delete(selected.unwrap(), window, cx);
-                assert!(app.pending_deletion.is_none());
-                app.start(temp.0.join("another-root"), window, cx);
+                assert!(app.session.busy() && !app.session.reconciling());
+                assert!(app.session.result.is_none());
+                assert_eq!(app.session.summary(), (0, 0, 0, 0));
+                assert!(app.session.selected.is_none() && app.session.expanded.is_empty());
+                assert!(app.tiles.is_empty() && app.map_parent.is_none());
+                assert!(app.session.query.is_empty());
+                assert!(app.search_input.read(cx).value().is_empty());
                 assert_eq!(
-                    app.session.root_path,
-                    Some(new_root.clone()),
-                    "busy start is ignored"
+                    app.path_input.read(cx).value().as_ref(),
+                    new_root.to_str().unwrap()
                 );
-                assert_eq!(app.generation, generation.wrapping_add(1));
+                assert!(!app.deletable_item(old_selected, DeletionMode::Permanent));
+                app.request_delete(old_selected, window, cx);
+                assert!(app.pending_deletion.is_none());
+                assert!(
+                    !app.navigation_blocked(),
+                    "new directory inputs remain usable"
+                );
             });
             window.render_frame(cx);
-            assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
-            assert_eq!(
-                window.find("map-root").bounds(),
-                map_bounds,
-                "no loading layout shift"
-            );
-            assert!(window
-                .find_by_label(&format!("当前显示：{}", old_root.display()))
-                .visible());
+            assert!(window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
             assert!(window
                 .find_by_label(&format!("正在扫描：{}", new_root.display()))
                 .visible());
-            if outcome == "cancel" {
+            if outcome == "newer-root" {
+                view.update(cx, |app, cx| app.start(latest_root.clone(), window, cx));
+                window.render_frame(cx);
+                assert!(window
+                    .find_by_label(&format!("正在扫描：{}", latest_root.display()))
+                    .visible());
+            } else if outcome == "cancel" {
                 view.update(cx, |app, _| app.session.cancel());
             }
             let deadline = Instant::now() + Duration::from_secs(5);
             while view.read(cx).busy() && Instant::now() < deadline {
                 view.update(cx, |app, cx| app.poll_session(window, cx));
                 window.render_frame(cx);
-                assert!(!window.find_all_by_role(gpui_kit::Role::TreeItem).is_empty());
-                assert_eq!(window.find("map-root").bounds(), map_bounds);
-                assert!(view.read(cx).session.result.is_some());
+                if let Some(scan) = &view.read(cx).session.result {
+                    assert_ne!(scan.root_path, old_root);
+                }
                 std::thread::sleep(Duration::from_millis(1));
             }
             let app = view.read(cx);
             assert!(!app.busy());
-            if outcome == "success" {
-                let scan = app.session.result.as_ref().unwrap();
-                assert_eq!(scan.root_path, new_root);
-                assert_eq!(app.session.revision(), revision.wrapping_add(1));
-                assert_eq!(app.generation, generation.wrapping_add(2));
-                assert_eq!(app.session.selected, Some(scan.root));
-                assert_eq!(app.map_parent, Some(scan.root));
-                assert_eq!(app.session.summary().2, 1);
-                assert!(app.session.query.is_empty());
-                assert!(app.search_input.read(cx).value().is_empty());
-                assert_eq!(app.scroll.0.borrow().base_handle.offset().y, px(0.0));
-                assert_eq!(
-                    app.path_input.read(cx).value().as_ref(),
-                    new_root.to_str().unwrap()
-                );
+            let target = if outcome == "newer-root" {
+                &latest_root
             } else {
-                assert_eq!(app.session.result.as_ref().unwrap().root_path, old_root);
-                assert_eq!(app.session.root_path, Some(old_root.clone()));
-                assert_eq!(app.session.revision(), revision);
-                assert_eq!(app.session.summary(), summary);
-                assert_eq!(app.session.selected, selected);
-                assert_eq!(app.session.expanded, expanded);
-                assert_eq!(app.map_parent, map_parent);
-                assert_eq!(app.session.query, "entry");
-                assert_eq!(app.search_input.read(cx).value().as_ref(), "entry");
-                assert_eq!(app.scroll.0.borrow().base_handle.offset(), scroll);
-                assert_eq!(
-                    app.path_input.read(cx).value().as_ref(),
-                    old_root.to_str().unwrap()
-                );
-                assert!(app.session.status.contains("保留"));
-                assert!(app.deletable_item(selected.unwrap(), DeletionMode::Trash));
+                &new_root
+            };
+            assert_eq!(app.session.root_path.as_ref(), Some(target));
+            assert_eq!(
+                app.path_input.read(cx).value().as_ref(),
+                target.to_str().unwrap()
+            );
+            if outcome == "error" {
+                assert!(app.session.result.is_none());
+                assert_eq!(app.session.summary(), (0, 0, 0, 0));
+                assert!(app.session.status.contains("扫描失败"));
+            } else {
+                let scan = app.session.result.as_ref().unwrap();
+                assert_eq!(&scan.root_path, target);
+                assert_eq!(app.map_parent, Some(scan.root));
+                assert_eq!(scan.cancelled, outcome == "cancel");
+                assert_eq!(app.scroll.0.borrow().base_handle.offset().y, px(0.0));
             }
         })
         .unwrap();
     }
+}
+
+#[gpui_kit::test]
+fn same_root_refresh_retains_view_and_new_search_survives_duplicate_click(cx: &mut TestAppContext) {
+    let (temp, handle, view, selected) = deletion_fixture(cx, 1440.0);
+    let other = temp.0.join("other");
+    std::fs::create_dir(&other).unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |app, cx| {
+            app.select_node(selected, cx);
+            let summary = app.session.summary();
+            let tiles = app.tiles.len();
+            app.refresh(window, cx);
+            assert!(app.session.reconciling());
+            assert!(app.navigation_blocked());
+            assert_eq!(app.session.selected, Some(selected));
+            assert_eq!(app.session.summary(), summary);
+            assert_eq!(app.tiles.len(), tiles);
+            app.start(other.clone(), window, cx);
+            assert_eq!(app.session.root_path, Some(temp.0.join("scan")));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.busy() && Instant::now() < deadline {
+                app.poll_session(window, cx);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!app.busy());
+            app.start(other.clone(), window, cx);
+            app.search_input
+                .update(cx, |input, cx| input.set_value("new search", window, cx));
+            app.session.set_query("new search".into());
+            let generation = app.generation;
+            app.start(other.clone(), window, cx);
+            assert_eq!(app.generation, generation);
+            assert_eq!(app.search_input.read(cx).value().as_ref(), "new search");
+            assert_eq!(app.session.query, "new search");
+        });
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

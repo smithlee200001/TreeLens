@@ -1,6 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod app;
+use tree_lens::ui;
 
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
@@ -24,7 +24,7 @@ fn main() {
     application().with_assets(assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
-        app::install_theme(cx);
+        ui::install_theme(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -40,7 +40,7 @@ fn main() {
         };
         if let Err(error) = gpui_kit::open_window(options, cx, move |window, cx| {
             window.set_window_title("Tree Lens · 磁盘空间分析");
-            cx.new(|cx| app::TreeLensApp::new(initial_path, window, cx))
+            cx.new(|cx| ui::TreeLensApp::new(initial_path, window, cx))
         }) {
             eprintln!("无法打开 Tree Lens：{error}");
             cx.quit();

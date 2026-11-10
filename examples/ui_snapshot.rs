@@ -1,8 +1,7 @@
 //! Real offscreen GPUI rendering, not a browser mockup. Requires a working GPU
 //! or software graphics driver. Usage: cargo run --features ui-tests --example
 //! ui_snapshot -- /path/to/scan output.png [width height]
-#[path = "../src/app.rs"]
-mod app;
+use tree_lens::ui;
 
 use gpui_kit::{
     component::{Theme, ThemeMode},
@@ -35,7 +34,7 @@ fn main() -> Result<()> {
     cx.update(|cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
-        app::install_theme(cx);
+        ui::install_theme(cx);
     });
     let (handle, view) = cx.update(|cx| {
         gpui_kit::open_window(
@@ -49,7 +48,7 @@ fn main() -> Result<()> {
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| app::TreeLensApp::new(scan, window, cx)),
+            |window, cx| cx.new(|cx| ui::TreeLensApp::new(scan, window, cx)),
         )
     })?;
     // The scanner is a real OS thread; the GPUI test clock is deterministic.
@@ -65,27 +64,32 @@ fn main() -> Result<()> {
                     app.preview_delete_confirmation(window, cx);
                 } else if preview == "--file-trash-dialog" {
                     app.preview_file_deletion(
-                        Some(tree_lens::deletion::DeletionMode::Trash),
-                        tree_lens::scanner::NodeKind::File,
+                        Some(tree_lens::features::delete::DeletionMode::Trash),
+                        tree_lens::features::scan::NodeKind::File,
                         window,
                         cx,
                     );
                 } else if preview == "--file-permanent-dialog" {
                     app.preview_file_deletion(
-                        Some(tree_lens::deletion::DeletionMode::Permanent),
-                        tree_lens::scanner::NodeKind::File,
+                        Some(tree_lens::features::delete::DeletionMode::Permanent),
+                        tree_lens::features::scan::NodeKind::File,
                         window,
                         cx,
                     );
                 } else if preview == "--folder-permanent-dialog" {
                     app.preview_file_deletion(
-                        Some(tree_lens::deletion::DeletionMode::Permanent),
-                        tree_lens::scanner::NodeKind::Directory,
+                        Some(tree_lens::features::delete::DeletionMode::Permanent),
+                        tree_lens::features::scan::NodeKind::Directory,
                         window,
                         cx,
                     );
                 } else if preview == "--file-selected" {
-                    app.preview_file_deletion(None, tree_lens::scanner::NodeKind::File, window, cx);
+                    app.preview_file_deletion(
+                        None,
+                        tree_lens::features::scan::NodeKind::File,
+                        window,
+                        cx,
+                    );
                 }
             });
         })?;

@@ -109,7 +109,7 @@ fn main() {
         scan.nodes.len(),
         scan.nodes[scan.root].file_count,
         scan.nodes[scan.root].total_logical_bytes,
-        std::mem::size_of::<tree_lens::scanner::Node>(),
+        std::mem::size_of::<tree_lens::features::scan::Node>(),
         scan_stats.0,
         scan_stats.1,
         scan_time.as_secs_f64() * 1000.0,

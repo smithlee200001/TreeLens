@@ -30,7 +30,8 @@ pub struct Session {
     query_changed: Option<Instant>,
     applied_query: String,
     reconciling: bool,
-    replacing: bool,
+    pending_root: Option<PathBuf>,
+    discarding_scan: bool,
     revision: u64,
     stale: bool,
 }
@@ -53,7 +54,8 @@ impl Default for Session {
             query_changed: None,
             applied_query: String::new(),
             reconciling: false,
-            replacing: false,
+            pending_root: None,
+            discarding_scan: false,
             revision: 0,
             stale: false,
         }
@@ -74,11 +76,6 @@ impl Session {
         self.reconciling
     }
 
-    /// A requested root is being scanned while the previous tree stays visible.
-    pub fn replacing(&self) -> bool {
-        self.replacing
-    }
-
     /// Changes only when a new scan is installed, not on failed retained scans.
     pub fn revision(&self) -> u64 {
         self.revision
@@ -95,28 +92,47 @@ impl Session {
     }
 
     pub fn cancelling(&self) -> bool {
-        self.cancellation
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        self.pending_root.is_none()
+            && self
+                .cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
-    /// Start a background scan. Returns false if already busy or spawning failed.
-    /// Cancellation must finish before another scan can start.
+    /// Switch to a requested root immediately. Keep one scanner: a newer root
+    /// cancels the active scan and replaces the pending destination. Old progress
+    /// and completions are discarded, even if already queued before the click.
+    /// Same-root refreshes and post-deletion reconciliation retain their view.
     pub fn start(&mut self, path: PathBuf) -> bool {
-        if self.busy() {
+        if self.reconciling
+            || (self.busy() && self.root_path.as_ref() == Some(&path) && !self.cancelling())
+        {
             return false;
         }
-        self.reconciling = false;
-        self.replacing = self.result.is_some();
-        self.root_path = Some(path.clone());
-        if !self.replacing {
-            self.stale = false;
-            self.reset_navigation();
-            self.rows = VisibleTree::new();
+        if !self.busy()
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|scan| scan.root_path == path)
+        {
+            return self.reconcile();
         }
+        let was_busy = self.busy();
+        if was_busy {
+            if let Some(flag) = &self.cancellation {
+                flag.store(true, Ordering::Relaxed);
+            }
+            self.discarding_scan = true;
+            self.pending_root = Some(path.clone());
+        }
+        self.root_path = Some(path.clone());
+        self.result = None;
+        self.stale = false;
+        self.reset_navigation();
+        self.rows = VisibleTree::new();
         self.progress = None;
         self.status = "正在扫描…".into();
-        self.spawn_scan(path)
+        was_busy || self.spawn_scan(path)
     }
 
     /// Revalidate after a filesystem change without clearing the displayed tree.
@@ -168,9 +184,6 @@ impl Session {
                 if self.reconciling {
                     self.reconciliation_failed(&format!("无法启动扫描：{error}"));
                     self.reconciling = false;
-                } else if self.replacing {
-                    self.replacement_failed(&format!("无法启动扫描：{error}"));
-                    self.replacing = false;
                 } else {
                     self.status = format!("无法启动扫描：{error}");
                 }
@@ -181,6 +194,7 @@ impl Session {
 
     /// Cooperative, nonblocking cancellation; partial results arrive via `poll`.
     pub fn cancel(&mut self) {
+        self.pending_root = None;
         if let Some(flag) = &self.cancellation {
             flag.store(true, Ordering::Relaxed);
             self.status = "正在取消扫描…".into();
@@ -204,26 +218,46 @@ impl Session {
 
     fn poll_at(&mut self, now: Instant) -> bool {
         let mut changed = false;
-        if let Some(latest) = &self.latest_progress {
-            if let Ok(mut slot) = latest.lock() {
-                if let Some(progress) = slot.take() {
-                    self.progress = Some(progress);
-                    changed = self.result.is_none();
+        if !self.discarding_scan {
+            if let Some(latest) = &self.latest_progress {
+                if let Ok(mut slot) = latest.lock() {
+                    if let Some(progress) = slot.take() {
+                        self.progress = Some(progress);
+                        changed = self.result.is_none();
+                    }
                 }
             }
         }
         let event = self.receiver.as_ref().map(|receiver| receiver.try_recv());
+        // Do not join on the UI thread or spawn one worker per click. Once the
+        // cancelled worker exits, launch only the most recently chosen root.
+        if self.discarding_scan {
+            if matches!(
+                event,
+                Some(Ok(_)) | Some(Err(mpsc::TryRecvError::Disconnected))
+            ) {
+                self.receiver = None;
+                self.cancellation = None;
+                self.latest_progress = None;
+                self.discarding_scan = false;
+                if let Some(path) = self.pending_root.take() {
+                    self.spawn_scan(path);
+                } else {
+                    self.status = "扫描已取消。".into();
+                }
+                return true;
+            }
+            return self.apply_due_query(now);
+        }
         let mut completed = false;
         match event {
             Some(Ok(result)) => {
                 match result {
-                    Ok(scan) if self.replacing && (scan.cancelled || self.cancelling()) => {
-                        self.replacement_failed("扫描已取消");
-                    }
                     Ok(scan) if self.reconciling && (scan.cancelled || self.cancelling()) => {
                         self.reconciliation_failed("更新已取消");
                     }
                     Ok(mut scan) => {
+                        scan.cancelled |= self.cancelling();
                         let root = &scan.nodes[scan.root];
                         self.status = if scan.cancelled {
                             "扫描已取消，下方仅显示已扫描部分，不代表完整大小。".into()
@@ -241,19 +275,13 @@ impl Session {
                         if self.reconciling {
                             self.retain_navigation(&scan);
                         } else {
-                            if self.replacing {
-                                self.reset_navigation();
-                                self.root_path = Some(scan.root_path.clone());
-                            }
+                            self.root_path = Some(scan.root_path.clone());
                             self.expanded.insert(scan.root);
                             self.selected = Some(scan.root);
                         }
                         self.stale = false;
                         self.result = Some(scan);
                         self.revision = self.revision.wrapping_add(1);
-                    }
-                    Err(error) if self.replacing => {
-                        self.replacement_failed(&format!("扫描失败：{error}"));
                     }
                     Err(error) if self.reconciling => {
                         self.reconciliation_failed(&format!("扫描失败：{error}"));
@@ -263,9 +291,7 @@ impl Session {
                 completed = true;
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                if self.replacing {
-                    self.replacement_failed("扫描线程意外结束");
-                } else if self.reconciling {
+                if self.reconciling {
                     self.reconciliation_failed("扫描线程意外结束");
                 } else {
                     self.status = "扫描线程意外结束，请重新扫描。".into();
@@ -274,15 +300,8 @@ impl Session {
             }
             _ => {}
         }
-        let query_due = self
-            .query_changed
-            .is_some_and(|time| now.saturating_duration_since(time) >= QUERY_DEBOUNCE);
-        if query_due {
-            self.applied_query.clone_from(&self.query);
-            self.query_changed = None;
-        }
+        let query_due = self.apply_due_query(now);
         if completed {
-            self.replacing = false;
             self.reconciling = false;
             self.receiver = None;
             self.cancellation = None;
@@ -303,9 +322,17 @@ impl Session {
         self.query.clear();
     }
 
-    fn replacement_failed(&mut self, reason: &str) {
-        self.root_path = self.result.as_ref().map(|scan| scan.root_path.clone());
-        self.status = format!("{reason}；保留原目录视图。");
+    fn apply_due_query(&mut self, now: Instant) -> bool {
+        if self
+            .query_changed
+            .is_some_and(|time| now.saturating_duration_since(time) >= QUERY_DEBOUNCE)
+        {
+            self.applied_query.clone_from(&self.query);
+            self.query_changed = None;
+            true
+        } else {
+            false
+        }
     }
 
     fn reconciliation_failed(&mut self, reason: &str) {

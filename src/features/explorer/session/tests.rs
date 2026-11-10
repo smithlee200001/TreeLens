@@ -59,23 +59,91 @@ fn query_debounce_is_applied_once_without_sleeping() {
 }
 
 #[test]
-fn start_stays_guarded_during_cancellation_and_drop_signals_worker() {
+fn superseding_scan_is_latest_wins_and_drop_signals_worker() {
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let latest = Fixture::new();
     let mut session = Session::new();
     assert!(!session.refresh());
-    session.cancel();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let flag = Arc::new(AtomicBool::new(false));
+    let progress: ProgressSlot = Arc::new(Mutex::new(Some(ScanProgress {
+        entries: 999,
+        ..ScanProgress::default()
+    })));
+    session.root_path = Some(first.0.clone());
+    session.receiver = Some(receiver);
+    session.latest_progress = Some(progress);
+    session.cancellation = Some(Arc::clone(&flag));
+    assert!(session.start(second.0.clone()));
+    assert!(flag.load(Ordering::Relaxed));
+    assert!(
+        !session.cancelling(),
+        "the latest request is active, not cancelled"
+    );
+    assert!(session.start(latest.0.clone()));
+    assert_eq!(session.root_path.as_ref(), Some(&latest.0));
+    assert_eq!(session.pending_root.as_ref(), Some(&latest.0));
+    assert!(
+        !session.start(latest.0.clone()),
+        "duplicate request is a no-op"
+    );
+    assert!(!session.poll());
+    assert!(
+        session.progress.is_none(),
+        "superseded progress is never displayed"
+    );
+    sender.send(Ok(first.scan())).unwrap();
+    assert!(session.poll());
+    assert!(session.result.is_none(), "queued old success is discarded");
+    assert!(session.busy());
+    finish(&mut session);
+    assert_eq!(session.result.as_ref().unwrap().root_path, latest.0);
+    assert_eq!(session.revision(), 1);
+
     let (_sender, receiver) = mpsc::sync_channel(1);
     let flag = Arc::new(AtomicBool::new(false));
     session.receiver = Some(receiver);
     session.cancellation = Some(Arc::clone(&flag));
-    assert!(!session.start(PathBuf::from("ignored")));
-    assert!(session.root_path.is_none());
-    session.cancel();
-    assert!(session.busy());
-    assert!(session.cancelling());
-    assert!(!session.start(PathBuf::from("still-ignored")));
-    flag.store(false, Ordering::Relaxed);
     drop(session);
     assert!(flag.load(Ordering::Relaxed));
+}
+
+#[test]
+fn cancelling_pending_root_does_not_install_old_result_or_launch_new_scan() {
+    let first = Fixture::new();
+    let next = Fixture::new();
+    let mut session = Session::new();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    session.receiver = Some(receiver);
+    session.cancellation = Some(Arc::new(AtomicBool::new(false)));
+    assert!(session.start(next.0.clone()));
+    session.cancel();
+    assert!(session.cancelling());
+    assert!(session.pending_root.is_none());
+    sender.send(Ok(first.scan())).unwrap();
+    session.poll();
+    assert!(!session.busy());
+    assert!(session.result.is_none());
+    assert_eq!(session.root_path, Some(next.0.clone()));
+    assert_eq!(session.revision(), 0);
+    assert!(session.status.contains("已取消"));
+    assert!(session.start(next.0.clone()));
+    finish(&mut session);
+    assert_eq!(session.result.as_ref().unwrap().root_path, next.0);
+}
+
+#[test]
+fn superseded_worker_disconnect_starts_latest_root() {
+    let latest = Fixture::new();
+    let mut session = Session::new();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    session.receiver = Some(receiver);
+    assert!(session.start(latest.0.clone()));
+    drop(sender);
+    assert!(session.poll());
+    finish(&mut session);
+    assert_eq!(session.result.as_ref().unwrap().root_path, latest.0);
 }
 
 #[test]
@@ -513,7 +581,7 @@ fn hundred_thousand_node_reconciliation_remaps_dense_ids_and_search() {
         .is_some());
 }
 #[test]
-fn replacing_root_retains_view_until_atomic_success() {
+fn changing_root_clears_old_view_immediately_and_preserves_new_search() {
     let original = Fixture::new();
     let replacement = Fixture::new();
     std::fs::write(original.0.join("old"), b"previous").unwrap();
@@ -523,150 +591,113 @@ fn replacing_root_retains_view_until_atomic_success() {
     session.sort_by(SortBy::Name);
     session.set_query("old".into());
     session.poll_at(session.query_changed.unwrap() + QUERY_DEBOUNCE);
-    session.set_query("pending".into());
-    let debounce = session.query_changed;
-    let old_selected = session.selected;
-    let old_expanded = session.expanded.clone();
-    let old_summary = session.summary();
-    let old_rows = session.rows.len();
     let revision = session.revision();
     assert!(session.start(replacement.0.clone()));
-    assert!(session.replacing() && session.busy());
-    assert!(!session.reconciling());
-    assert_eq!(session.result.as_ref().unwrap().root_path, original.0);
+    assert!(session.busy() && !session.reconciling());
+    assert!(session.result.is_none());
     assert_eq!(session.root_path.as_ref(), Some(&replacement.0));
-    assert_eq!(session.selected, old_selected);
-    assert_eq!(session.expanded, old_expanded);
-    assert_eq!(session.summary(), old_summary);
-    assert_eq!(session.rows.len(), old_rows);
-    assert_eq!(session.query, "pending");
-    assert_eq!(session.applied_query(), "old");
-    assert_eq!(session.query_changed, debounce);
+    assert!(session.selected.is_none() && session.expanded.is_empty());
+    assert_eq!(session.summary(), (0, 0, 0, 0));
+    assert_eq!(session.rows.len(), 0);
+    assert!(session.query.is_empty() && session.applied_query().is_empty());
+    assert!(session.query_changed.is_none());
     assert_eq!(session.revision(), revision);
-    assert!(!session.start(original.0.clone()));
     assert!(!session.reconcile());
-    assert_eq!(session.root_path.as_ref(), Some(&replacement.0));
+    session.set_query("new".into());
     finish(&mut session);
-    assert!(!session.replacing());
+    session.poll_at(session.query_changed.unwrap() + QUERY_DEBOUNCE);
     assert_eq!(session.revision(), revision + 1);
     assert_eq!(session.result.as_ref().unwrap().root_path, replacement.0);
     assert_eq!(session.expanded, HashSet::from([0]));
     assert_eq!(session.selected, Some(0));
-    assert_eq!(session.query, "");
-    assert_eq!(session.applied_query(), "");
-    assert_eq!(session.query_changed, None);
+    assert_eq!(session.query, "new");
+    assert_eq!(session.applied_query(), "new");
     assert_eq!(session.sort, SortBy::Name);
     assert!(session.node_for_path(&replacement.0.join("new")).is_some());
 }
 
 #[test]
-fn failed_root_replacement_preserves_old_view_and_revision() {
+fn failed_root_change_stays_at_requested_root_without_old_statistics() {
     let original = Fixture::new();
-    let replacement = Fixture::new();
-    std::fs::write(original.0.join("old"), b"previous").unwrap();
-    for mode in 0..4 {
-        let mut session = original.session();
-        session.stale = true; // Failed replacement must not clear an old warning.
-        session.select(session.node_for_path(&original.0.join("old")).unwrap());
-        session.set_query("old".into());
-        let changed = session.query_changed.unwrap();
-        session.poll_at(changed + QUERY_DEBOUNCE);
-        let selected = session.selected;
-        let summary = session.summary();
-        let rows = session.rows.len();
-        let revision = session.revision();
-        session.replacing = true;
-        session.root_path = Some(replacement.0.clone());
+    let missing = original.0.join("missing");
+    let mut session = original.session();
+    let revision = session.revision();
+    assert!(session.start(missing.clone()));
+    finish(&mut session);
+    assert_eq!(session.root_path, Some(missing));
+    assert!(session.result.is_none());
+    assert!(session.selected.is_none() && session.expanded.is_empty());
+    assert_eq!(session.summary(), (0, 0, 0, 0));
+    assert_eq!(session.rows.len(), 0);
+    assert_eq!(session.revision(), revision);
+    assert!(session.status.contains("扫描失败"));
+    assert!(!session.status.contains("保留"));
+}
+
+#[test]
+fn same_root_refresh_keeps_view_and_navigation() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.0.join("keep"), b"fixture").unwrap();
+    let mut session = fixture.session();
+    session.select(session.node_for_path(&fixture.0.join("keep")).unwrap());
+    session.set_query("keep".into());
+    session.poll_at(session.query_changed.unwrap() + QUERY_DEBOUNCE);
+    let selected = session.selected;
+    let summary = session.summary();
+    assert!(session.start(fixture.0.clone()));
+    assert!(session.reconciling());
+    assert_eq!(session.selected, selected);
+    assert_eq!(session.summary(), summary);
+    assert_eq!(session.applied_query(), "keep");
+    finish(&mut session);
+    assert_eq!(session.selected, selected);
+    assert_eq!(session.applied_query(), "keep");
+}
+
+#[test]
+fn cancelled_scan_installs_only_current_roots_partial_result() {
+    for cancelled_in_worker in [true, false] {
+        let fixture = Fixture::new();
+        let mut session = Session::new();
+        session.root_path = Some(fixture.0.clone());
+        let mut scan = fixture.scan();
+        scan.cancelled = cancelled_in_worker;
         let (sender, receiver) = mpsc::sync_channel(1);
         session.receiver = Some(receiver);
-        match mode {
-            0 => sender
-                .send(Err("cannot scan requested root".into()))
-                .unwrap(),
-            1 => {
-                let mut scan = replacement.scan();
-                scan.cancelled = true;
-                sender.send(Ok(scan)).unwrap();
-            }
-            2 => {} // disconnected worker
-            _ => {
-                // Exercise the spawn-error rollback without exhausting OS threads.
-                session.replacement_failed("无法启动扫描");
-                session.replacing = false;
-                session.receiver = None;
-            }
-        }
-        drop(sender);
-        session.poll_at(changed + QUERY_DEBOUNCE);
-        assert!(!session.busy() && !session.replacing());
-        assert_eq!(session.revision(), revision);
-        assert_eq!(session.root_path.as_ref(), Some(&original.0));
-        assert_eq!(session.result.as_ref().unwrap().root_path, original.0);
-        assert_eq!(session.selected, selected);
-        assert_eq!(session.summary(), summary);
-        assert_eq!(session.rows.len(), rows);
-        assert_eq!(session.query, "old");
-        assert_eq!(session.applied_query(), "old");
-        assert!(session.stale());
-        assert!(session.status.contains("保留原目录视图"));
+        session.cancellation = Some(Arc::new(AtomicBool::new(false)));
+        sender.send(Ok(scan)).unwrap();
+        session.cancel(); // Also wins when success is already queued.
+        session.poll();
+        assert_eq!(session.result.as_ref().unwrap().root_path, fixture.0);
+        assert!(session.result.as_ref().unwrap().cancelled);
+        assert!(session.partial());
+        assert!(session.status.contains("扫描已取消"));
     }
 }
 
 #[test]
-fn initial_cancelled_scan_still_installs_partial_result() {
-    let fixture = Fixture::new();
-    let mut session = Session::new();
-    let mut scan = fixture.scan();
-    scan.cancelled = true;
+fn cancellation_after_reconciliation_completion_keeps_retained_view() {
+    let original = Fixture::new();
+    std::fs::write(original.0.join("old"), b"previous").unwrap();
+    let mut session = original.session();
+    session.select(session.node_for_path(&original.0.join("old")).unwrap());
+    let selected = session.selected;
+    let summary = session.summary();
+    let rows = session.rows.len();
+    let revision = session.revision();
+    session.reconciling = true;
     let (sender, receiver) = mpsc::sync_channel(1);
     session.receiver = Some(receiver);
-    sender.send(Ok(scan)).unwrap();
-    session.poll();
-    assert!(session.result.as_ref().unwrap().cancelled);
-    assert_eq!(session.revision(), 1);
-    assert!(session.partial());
-    assert!(!session.replacing());
-}
-#[test]
-fn cancellation_after_worker_completion_keeps_retained_view() {
-    let original = Fixture::new();
-    let replacement = Fixture::new();
-    std::fs::write(original.0.join("old"), b"previous").unwrap();
-    for replacing in [true, false] {
-        let mut session = original.session();
-        session.select(session.node_for_path(&original.0.join("old")).unwrap());
-        let selected = session.selected;
-        let summary = session.summary();
-        let rows = session.rows.len();
-        let revision = session.revision();
-        session.replacing = replacing;
-        session.reconciling = !replacing;
-        if replacing {
-            session.root_path = Some(replacement.0.clone());
-        }
-        let (sender, receiver) = mpsc::sync_channel(1);
-        session.receiver = Some(receiver);
-        session.cancellation = Some(Arc::new(AtomicBool::new(false)));
-        // The worker finished before cancellation, but its result has not
-        // yet been applied. User cancellation still wins at this boundary.
-        sender
-            .send(Ok(if replacing {
-                replacement.scan()
-            } else {
-                original.scan()
-            }))
-            .unwrap();
-        session.cancel();
-        assert!(session.cancelling());
-        assert!(session.poll());
-        assert!(!session.busy());
-        assert!(!session.replacing() && !session.reconciling());
-        assert_eq!(session.revision(), revision);
-        assert_eq!(session.root_path.as_ref(), Some(&original.0));
-        assert_eq!(session.result.as_ref().unwrap().root_path, original.0);
-        assert_eq!(session.selected, selected);
-        assert_eq!(session.summary(), summary);
-        assert_eq!(session.rows.len(), rows);
-        assert_eq!(session.stale(), !replacing);
-    }
+    session.cancellation = Some(Arc::new(AtomicBool::new(false)));
+    sender.send(Ok(original.scan())).unwrap();
+    session.cancel();
+    assert!(session.poll());
+    assert!(!session.busy() && !session.reconciling());
+    assert_eq!(session.revision(), revision);
+    assert_eq!(session.root_path.as_ref(), Some(&original.0));
+    assert_eq!(session.result.as_ref().unwrap().root_path, original.0);
+    assert_eq!(session.selected, selected);
+    assert_eq!(session.summary(), summary);
+    assert_eq!(session.rows.len(), rows);
+    assert!(session.stale());
 }

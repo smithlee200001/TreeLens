@@ -74,20 +74,18 @@ impl TreeLensApp {
     }
 
     pub(super) fn start(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy() || self.pending_deletion.is_some() {
+        if self.navigation_blocked() {
             return;
         }
-        self.pending_deletion = None;
         self.deletion_notice = None;
-        let retained_view = self.session.result.is_some();
-        if !self.session.start(path.clone()) {
-            if retained_view {
-                if let Some(root) = &self.session.root_path {
-                    self.path_input.update(cx, |input, cx| {
-                        input.set_value(root.display().to_string(), window, cx)
-                    });
-                }
-            }
+        let previous_root = self.session.root_path.clone();
+        let had_result = self.session.result.is_some();
+        let started = self.session.start(path.clone());
+        if !started
+            && previous_root == self.session.root_path
+            && !(had_result && self.session.result.is_none())
+        {
+            // A guarded or duplicate request did not change the destination.
             cx.notify();
             return;
         }
@@ -95,19 +93,18 @@ impl TreeLensApp {
         self.path_input.update(cx, |input, cx| {
             input.set_value(path.display().to_string(), window, cx)
         });
-        // A new scan root does not evict the displayed root. Keep its exact
-        // panels and navigation until a complete replacement is accepted.
-        if !retained_view {
+        if !self.session.reconciling() {
             self.search_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.tiles.clear();
             self.map_parent = None;
+            self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
         }
         cx.notify();
     }
 
     pub(super) fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy() || self.choosing || window.has_active_dialog(cx) {
+        if self.navigation_blocked() || self.choosing || window.has_active_dialog(cx) {
             return;
         }
         self.choosing = true;
@@ -142,9 +139,8 @@ impl TreeLensApp {
     /// Reconciliation keeps the same list and panels mounted. Capture navigation
     /// immediately before applying a worker result, so scrolling, selection and
     /// map navigation performed while the worker ran are never rolled back.
-    pub(super) fn poll_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn poll_session(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let was_busy = self.session.busy();
-        let was_replacing = self.session.replacing();
         let revision = self.session.revision();
         let reconciling = self.session.reconciling();
         let applied_query = self.session.applied_query().to_owned();
@@ -188,19 +184,6 @@ impl TreeLensApp {
             } else if accepted {
                 self.reset_projection();
                 self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
-                if was_replacing {
-                    self.search_input
-                        .update(cx, |input, cx| input.set_value("", window, cx));
-                }
-            }
-            if was_replacing {
-                // On failure/cancellation Session restores the displayed root.
-                // Never leave an editable target path claiming to be the view.
-                if let Some(root) = &self.session.root_path {
-                    self.path_input.update(cx, |input, cx| {
-                        input.set_value(root.display().to_string(), window, cx)
-                    });
-                }
             }
         }
         if query_changed {
@@ -318,6 +301,15 @@ impl TreeLensApp {
             }
         }
         cx.notify();
+    }
+
+    /// Scanning another root is interruptible; deletion and its reconciliation
+    /// are not. These guards also protect native picker/keyboard/drop entry points.
+    pub(super) fn navigation_blocked(&self) -> bool {
+        self.deletion.is_some()
+            || self.preparing_deletion.is_some()
+            || self.pending_deletion.is_some()
+            || self.session.reconciling()
     }
 
     pub(super) fn busy(&self) -> bool {
